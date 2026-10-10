@@ -729,6 +729,16 @@ namespace AspireSense
             this.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 140, 240));
             this.BorderThickness = new Thickness(1);
 
+            string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app.ico");
+            if (File.Exists(icoPath))
+            {
+                try
+                {
+                    this.Icon = new System.Windows.Media.Imaging.BitmapImage(new Uri(icoPath, UriKind.Absolute));
+                }
+                catch { }
+            }
+
             try
             {
                 cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
@@ -841,17 +851,42 @@ namespace AspireSense
                 Margin = new Thickness(20, 0, 0, 0)
             };
 
-            Path aLogo = new Path
+            string logoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
+            if (File.Exists(logoPath))
             {
-                Width = 24,
-                Height = 24,
-                Stretch = Stretch.Fill,
-                Fill = new LinearGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(0, 100, 255), 45),
-                Data = Geometry.Parse("M 12,2 L 22,22 L 17,22 L 14,15 L 10,15 L 7,22 L 2,22 Z M 12,8 L 10.5,12 L 13.5,12 Z"),
-                Margin = new Thickness(0, 0, 10, 0),
-                Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 12, ShadowDepth = 0, Opacity = 0.8 }
-            };
-            logoPanel.Children.Add(aLogo);
+                try
+                {
+                    System.Windows.Media.Imaging.BitmapImage bmp = new System.Windows.Media.Imaging.BitmapImage();
+                    bmp.BeginInit();
+                    bmp.UriSource = new Uri(logoPath, UriKind.Absolute);
+                    bmp.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                    bmp.EndInit();
+
+                    Image imgLogo = new Image
+                    {
+                        Source = bmp,
+                        Width = 30,
+                        Height = 30,
+                        Margin = new Thickness(0, 0, 10, 0),
+                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 14, ShadowDepth = 0, Opacity = 0.85 }
+                    };
+                    logoPanel.Children.Add(imgLogo);
+                }
+                catch { }
+            }
+            else
+            {
+                Path aLogo = new Path
+                {
+                    Width = 24,
+                    Height = 24,
+                    Stretch = Stretch.Fill,
+                    Fill = new LinearGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(0, 100, 255), 45),
+                    Data = Geometry.Parse("M 12,2 L 22,22 L 17,22 L 14,15 L 10,15 L 7,22 L 2,22 Z M 12,8 L 10.5,12 L 13.5,12 Z"),
+                    Margin = new Thickness(0, 0, 10, 0)
+                };
+                logoPanel.Children.Add(aLogo);
+            }
 
             TextBlock txtLogo = new TextBlock
             {
@@ -1081,28 +1116,55 @@ namespace AspireSense
 
             StackPanel sp = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
 
-            Path logoCenter = new Path
+            string logoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
+            if (File.Exists(logoPath))
             {
-                Width = 56,
-                Height = 56,
-                Stretch = Stretch.Fill,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Fill = new LinearGradientBrush
+                try
                 {
-                    StartPoint = new Point(0, 0),
-                    EndPoint = new Point(1, 1),
-                    GradientStops = new GradientStopCollection
+                    System.Windows.Media.Imaging.BitmapImage bmpCenter = new System.Windows.Media.Imaging.BitmapImage();
+                    bmpCenter.BeginInit();
+                    bmpCenter.UriSource = new Uri(logoPath, UriKind.Absolute);
+                    bmpCenter.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                    bmpCenter.EndInit();
+
+                    Image imgCenter = new Image
                     {
-                        new GradientStop(Color.FromRgb(0, 225, 255), 0.0),
-                        new GradientStop(Color.FromRgb(0, 100, 255), 0.7),
-                        new GradientStop(Color.FromRgb(0, 40, 180), 1.0)
-                    }
-                },
-                Data = Geometry.Parse("M 20,2 L 38,36 L 30,36 L 24,24 L 16,24 L 10,36 L 2,36 Z M 20,11 L 18,18 L 22,18 Z"),
-                Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 25, ShadowDepth = 0, Opacity = 0.85 },
-                Margin = new Thickness(0, 0, 0, 10)
-            };
-            sp.Children.Add(logoCenter);
+                        Source = bmpCenter,
+                        Width = 72,
+                        Height = 72,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        Margin = new Thickness(0, 0, 0, 10),
+                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 26, ShadowDepth = 0, Opacity = 0.9 }
+                    };
+                    sp.Children.Add(imgCenter);
+                }
+                catch { }
+            }
+            else
+            {
+                Path logoCenter = new Path
+                {
+                    Width = 56,
+                    Height = 56,
+                    Stretch = Stretch.Fill,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Fill = new LinearGradientBrush
+                    {
+                        StartPoint = new Point(0, 0),
+                        EndPoint = new Point(1, 1),
+                        GradientStops = new GradientStopCollection
+                        {
+                            new GradientStop(Color.FromRgb(0, 225, 255), 0.0),
+                            new GradientStop(Color.FromRgb(0, 100, 255), 0.7),
+                            new GradientStop(Color.FromRgb(0, 40, 180), 1.0)
+                        }
+                    },
+                    Data = Geometry.Parse("M 20,2 L 38,36 L 30,36 L 24,24 L 16,24 L 10,36 L 2,36 Z M 20,11 L 18,18 L 22,18 Z"),
+                    Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 25, ShadowDepth = 0, Opacity = 0.85 },
+                    Margin = new Thickness(0, 0, 0, 10)
+                };
+                sp.Children.Add(logoCenter);
+            }
 
             TextBlock title = new TextBlock
             {

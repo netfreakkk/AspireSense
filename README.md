@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" width="128" height="128" alt="AspireSense Winged Alpha Logo" />
+</p>
+
 # AspireSense (Open-Source Edition)
 
 A standalone, high-performance hardware monitor and cooling control center tailored for **Acer Aspire 7 (RTX 4050 / A715-79G)** and compatible gaming laptops.
