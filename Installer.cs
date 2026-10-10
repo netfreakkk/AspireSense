@@ -694,6 +694,19 @@ namespace AspireSenseInstaller
         {
             try
             {
+                UpdateProgress(10, "Checking running processes...", "Closing any active instances...");
+                try
+                {
+                    Process[] existingProcs = Process.GetProcessesByName("AspireSense");
+                    foreach (Process p in existingProcs)
+                    {
+                        try { p.CloseMainWindow(); } catch { }
+                        try { p.Kill(); } catch { }
+                        try { p.WaitForExit(1500); } catch { }
+                    }
+                }
+                catch { }
+
                 UpdateProgress(15, "Creating destination folder...", "Directory: " + installDir);
                 if (!Directory.Exists(installDir))
                 {
@@ -912,15 +925,18 @@ namespace AspireSenseInstaller
                 }
 
                 // Self delete script
-                string batchScript = IOPath.Combine(IOPath.GetTempPath(), "remove_aspiresense.bat");
-                string batchContent = string.Format("@echo off\r\ntimeout /t 1 /nobreak >nul\r\nrmdir /s /q \"{0}\"\r\ndel \"%~f0\"\r\n", installDir);
-                File.WriteAllText(batchScript, batchContent);
-                Process.Start(new ProcessStartInfo
+                if (!string.IsNullOrEmpty(installDir) && installDir.Length >= 6 && Directory.Exists(installDir))
                 {
-                    FileName = batchScript,
-                    WindowStyle = ProcessWindowStyle.Hidden,
-                    CreateNoWindow = true
-                });
+                    string batchScript = IOPath.Combine(IOPath.GetTempPath(), "remove_aspiresense.bat");
+                    string batchContent = string.Format("@echo off\r\ntimeout /t 1 /nobreak >nul\r\nrmdir /s /q \"{0}\"\r\ndel \"%~f0\"\r\n", installDir);
+                    File.WriteAllText(batchScript, batchContent);
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = batchScript,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        CreateNoWindow = true
+                    });
+                }
 
                 MessageBox.Show("AspireSense has been successfully uninstalled from your PC.", "Uninstallation Complete", MessageBoxButton.OK, MessageBoxImage.Information);
                 this.Close();

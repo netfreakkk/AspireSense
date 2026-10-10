@@ -254,11 +254,13 @@ namespace AspireSense
                 {
                     using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
                     {
-                        ManagementObjectCollection coll = searcher.Get();
-                        if (coll != null && coll.Count > 0)
+                        using (ManagementObjectCollection coll = searcher.Get())
                         {
-                            isWmiAvailable = true;
-                            return true;
+                            if (coll != null && coll.Count > 0)
+                            {
+                                isWmiAvailable = true;
+                                return true;
+                            }
                         }
                     }
                 }
@@ -322,14 +324,23 @@ namespace AspireSense
                     {
                         using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
                         {
-                            foreach (ManagementObject obj in searcher.Get())
+                            using (ManagementObjectCollection coll = searcher.Get())
                             {
-                                using (ManagementBaseObject inParams = obj.GetMethodParameters("DEVS"))
+                                foreach (ManagementObject obj in coll)
                                 {
-                                    inParams["Device_ID"] = deviceId;
-                                    inParams["Control_status"] = (uint)status;
-                                    ManagementBaseObject outParams = obj.InvokeMethod("DEVS", inParams, null);
-                                    return Convert.ToInt32(outParams["result"]);
+                                    using (obj)
+                                    {
+                                        using (ManagementBaseObject inParams = obj.GetMethodParameters("DEVS"))
+                                        {
+                                            inParams["Device_ID"] = deviceId;
+                                            inParams["Control_status"] = (uint)status;
+                                            using (ManagementBaseObject outParams = obj.InvokeMethod("DEVS", inParams, null))
+                                            {
+                                                if (outParams != null)
+                                                    return Convert.ToInt32(outParams["result"]);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -385,13 +396,22 @@ namespace AspireSense
                     {
                         using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
                         {
-                            foreach (ManagementObject obj in searcher.Get())
+                            using (ManagementObjectCollection coll = searcher.Get())
                             {
-                                using (ManagementBaseObject inParams = obj.GetMethodParameters("DSTS"))
+                                foreach (ManagementObject obj in coll)
                                 {
-                                    inParams["Device_ID"] = deviceId;
-                                    ManagementBaseObject outParams = obj.InvokeMethod("DSTS", inParams, null);
-                                    return Convert.ToInt32(outParams["result"]) - 65536;
+                                    using (obj)
+                                    {
+                                        using (ManagementBaseObject inParams = obj.GetMethodParameters("DSTS"))
+                                        {
+                                            inParams["Device_ID"] = deviceId;
+                                            using (ManagementBaseObject outParams = obj.InvokeMethod("DSTS", inParams, null))
+                                            {
+                                                if (outParams != null)
+                                                    return Convert.ToInt32(outParams["result"]) - 65536;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -523,11 +543,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM LNVPC_WMI"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -537,11 +559,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM Lenovo_Vantage_EC"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -562,13 +586,21 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM LNVPC_WMI"))
                 {
-                    foreach (ManagementObject obj in s.Get())
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        using (ManagementBaseObject inParams = obj.GetMethodParameters("SetSmartFanMode"))
+                        foreach (ManagementObject obj in coll)
                         {
-                            inParams["Mode"] = lenovoMode;
-                            obj.InvokeMethod("SetSmartFanMode", inParams, null);
-                            return true;
+                            using (obj)
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("SetSmartFanMode"))
+                                {
+                                    inParams["Mode"] = lenovoMode;
+                                    using (ManagementBaseObject outParams = obj.InvokeMethod("SetSmartFanMode", inParams, null))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -579,13 +611,21 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM Lenovo_Vantage_EC"))
                 {
-                    foreach (ManagementObject obj in s.Get())
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        using (ManagementBaseObject inParams = obj.GetMethodParameters("SetPerformanceMode"))
+                        foreach (ManagementObject obj in coll)
                         {
-                            inParams["Mode"] = lenovoMode;
-                            obj.InvokeMethod("SetPerformanceMode", inParams, null);
-                            return true;
+                            using (obj)
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("SetPerformanceMode"))
+                                {
+                                    inParams["Mode"] = lenovoMode;
+                                    using (ManagementBaseObject outParams = obj.InvokeMethod("SetPerformanceMode", inParams, null))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -618,11 +658,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM hpqBIntM"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -632,11 +674,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM HP_BiosSetting"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -656,14 +700,22 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM hpqBIntM"))
                 {
-                    foreach (ManagementObject obj in s.Get())
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        using (ManagementBaseObject inParams = obj.GetMethodParameters("BiosControl"))
+                        foreach (ManagementObject obj in coll)
                         {
-                            inParams["Command"] = (uint)0x20008;
-                            inParams["Input"] = hpMode;
-                            obj.InvokeMethod("BiosControl", inParams, null);
-                            return true;
+                            using (obj)
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("BiosControl"))
+                                {
+                                    inParams["Command"] = (uint)0x20008;
+                                    inParams["Input"] = hpMode;
+                                    using (ManagementBaseObject outParams = obj.InvokeMethod("BiosControl", inParams, null))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -689,11 +741,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM Dell_ThermalInformation"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -703,11 +757,13 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM Alienware_Platform"))
                 {
-                    ManagementObjectCollection coll = s.Get();
-                    if (coll != null && coll.Count > 0)
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        isAvailable = true;
-                        return true;
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isAvailable = true;
+                            return true;
+                        }
                     }
                 }
             }
@@ -727,13 +783,21 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM Dell_ThermalInformation"))
                 {
-                    foreach (ManagementObject obj in s.Get())
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        using (ManagementBaseObject inParams = obj.GetMethodParameters("SetThermalProfile"))
+                        foreach (ManagementObject obj in coll)
                         {
-                            inParams["Profile"] = dellMode;
-                            obj.InvokeMethod("SetThermalProfile", inParams, null);
-                            return true;
+                            using (obj)
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("SetThermalProfile"))
+                                {
+                                    inParams["Profile"] = dellMode;
+                                    using (ManagementBaseObject outParams = obj.InvokeMethod("SetThermalProfile", inParams, null))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -847,15 +911,15 @@ namespace AspireSense
         public static int CurrentCustomDuty = 50;
 
         // Chassis & Firmware Profile
-        public static string ChassisCpuName = "Intel Core 5 210H";
-        public static string ChassisGpuName = "NVIDIA GeForce RTX 4050 Laptop GPU (6GB)";
-        public static string ChassisBiosVersion = "INSYDE Corp. v1.16RA1";
-        public static string ChassisEcVersion = "v9.13";
-        public static string ChassisModel = "Acer Aspire A715-79G";
+        public static string ChassisCpuName = "High-Performance Processor";
+        public static string ChassisGpuName = "Dedicated Graphics";
+        public static string ChassisBiosVersion = "System BIOS";
+        public static string ChassisEcVersion = "EC Controller";
+        public static string ChassisModel = "Gaming Laptop";
         public static string ChassisOs = "Windows 11 (64-bit)";
         public static double ChassisTotalRamGb = 16.0;
-        public static int CachedBatteryDesignMwh = 52514;
-        public static int CachedBatteryFullMwh = 53761;
+        public static int CachedBatteryDesignMwh = 54000;
+        public static int CachedBatteryFullMwh = 54000;
 
         public static void InitializeHardware()
         {
@@ -879,6 +943,41 @@ namespace AspireSense
             catch
             {
                 nvmlReady = false;
+            }
+
+            // Fallback GPU detection via WMI if NVML is not available
+            if (!nvmlReady || ChassisGpuName == "Dedicated Graphics")
+            {
+                try
+                {
+                    using (ManagementObjectSearcher vs = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController"))
+                    {
+                        using (ManagementObjectCollection vcoll = vs.Get())
+                        {
+                            foreach (ManagementObject vobj in vcoll)
+                            {
+                                using (vobj)
+                                {
+                                    object vName = vobj["Name"];
+                                    if (vName != null)
+                                    {
+                                        string sName = vName.ToString().Trim();
+                                        if (sName.Contains("NVIDIA") || sName.Contains("GeForce") || sName.Contains("RTX") || sName.Contains("GTX") || sName.Contains("Radeon") || sName.Contains("Arc"))
+                                        {
+                                            ChassisGpuName = sName;
+                                            break;
+                                        }
+                                        else if (ChassisGpuName == "Dedicated Graphics")
+                                        {
+                                            ChassisGpuName = sName;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
             }
 
             // Read Total System Memory
@@ -976,26 +1075,47 @@ namespace AspireSense
             catch { }
 
             // Probe and initialize appropriate hardware vendor bridge
-            if (DetectedVendor == HardwareVendor.Asus || AsusAcpiBridge.Initialize())
+            if (DetectedVendor == HardwareVendor.Asus)
             {
-                DetectedVendor = HardwareVendor.Asus;
                 IsAsusHardware = true;
                 AsusAcpiBridge.Initialize();
             }
-            else if (DetectedVendor == HardwareVendor.Lenovo || LenovoWmiBridge.Initialize())
+            else if (DetectedVendor == HardwareVendor.Lenovo)
             {
-                DetectedVendor = HardwareVendor.Lenovo;
                 LenovoWmiBridge.Initialize();
             }
-            else if (DetectedVendor == HardwareVendor.Hp || HpWmiBridge.Initialize())
+            else if (DetectedVendor == HardwareVendor.Hp)
             {
-                DetectedVendor = HardwareVendor.Hp;
                 HpWmiBridge.Initialize();
             }
-            else if (DetectedVendor == HardwareVendor.Dell || DellWmiBridge.Initialize())
+            else if (DetectedVendor == HardwareVendor.Dell)
             {
-                DetectedVendor = HardwareVendor.Dell;
                 DellWmiBridge.Initialize();
+            }
+            else if (DetectedVendor == HardwareVendor.Acer)
+            {
+                // Native Acer Insyde EC bridge handled via AcerInsydeBridge
+            }
+            else
+            {
+                // Universal / Custom chassis fallback: probe driver endpoints
+                if (AsusAcpiBridge.Initialize())
+                {
+                    DetectedVendor = HardwareVendor.Asus;
+                    IsAsusHardware = true;
+                }
+                else if (LenovoWmiBridge.Initialize())
+                {
+                    DetectedVendor = HardwareVendor.Lenovo;
+                }
+                else if (HpWmiBridge.Initialize())
+                {
+                    DetectedVendor = HardwareVendor.Hp;
+                }
+                else if (DellWmiBridge.Initialize())
+                {
+                    DetectedVendor = HardwareVendor.Dell;
+                }
             }
 
             // Read Windows OS Build from Registry
@@ -1013,45 +1133,78 @@ namespace AspireSense
             }
             catch { }
 
+            // Dynamic battery full capacity detection via WMI
+            try
+            {
+                using (ManagementObjectSearcher bs = new ManagementObjectSearcher(@"root\wmi", "SELECT FullChargedCapacity FROM BatteryFullChargedCapacity"))
+                {
+                    using (ManagementObjectCollection bcoll = bs.Get())
+                    {
+                        foreach (ManagementObject bobj in bcoll)
+                        {
+                            using (bobj)
+                            {
+                                int full = Convert.ToInt32(bobj["FullChargedCapacity"]);
+                                if (full > 5000 && full < 200000)
+                                {
+                                    CachedBatteryFullMwh = full;
+                                    CachedBatteryDesignMwh = full;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
             ResetToAuto();
         }
 
+        private static bool isHardwareClosed = false;
+        private static readonly object closeLock = new object();
+
         public static void CloseHardware()
         {
-            try
+            lock (closeLock)
             {
-                if (DetectedVendor == HardwareVendor.Asus)
-                {
-                    AsusAcpiBridge.Close();
-                }
-                else if (DetectedVendor == HardwareVendor.Lenovo)
-                {
-                    LenovoWmiBridge.SetPerformanceMode(0);
-                }
-                else if (DetectedVendor == HardwareVendor.Hp)
-                {
-                    HpWmiBridge.SetThermalMode(0);
-                }
-                else if (DetectedVendor == HardwareVendor.Dell)
-                {
-                    DellWmiBridge.SetThermalMode(0);
-                }
-                else if (DetectedVendor == HardwareVendor.Acer)
-                {
-                    AcerInsydeBridge.ResetFans();
-                }
-            }
-            catch { }
+                if (isHardwareClosed) return;
+                isHardwareClosed = true;
 
-            try
-            {
-                if (nvmlReady)
+                try
                 {
-                    nvmlReady = false;
-                    nvmlShutdown();
+                    if (DetectedVendor == HardwareVendor.Asus)
+                    {
+                        AsusAcpiBridge.Close();
+                    }
+                    else if (DetectedVendor == HardwareVendor.Lenovo)
+                    {
+                        LenovoWmiBridge.SetPerformanceMode(0);
+                    }
+                    else if (DetectedVendor == HardwareVendor.Hp)
+                    {
+                        HpWmiBridge.SetThermalMode(0);
+                    }
+                    else if (DetectedVendor == HardwareVendor.Dell)
+                    {
+                        DellWmiBridge.SetThermalMode(0);
+                    }
+                    else if (DetectedVendor == HardwareVendor.Acer && AcerInsydeBridge.IsAvailable)
+                    {
+                        AcerInsydeBridge.ResetFans();
+                    }
                 }
+                catch { }
+
+                try
+                {
+                    if (nvmlReady)
+                    {
+                        nvmlReady = false;
+                        nvmlShutdown();
+                    }
+                }
+                catch { }
             }
-            catch { }
         }
 
         public static bool ResetToAuto()
@@ -1073,7 +1226,7 @@ namespace AspireSense
             {
                 return DellWmiBridge.SetThermalMode(0);
             }
-            else if (DetectedVendor == HardwareVendor.Acer)
+            else if (DetectedVendor == HardwareVendor.Acer && AcerInsydeBridge.IsAvailable)
             {
                 return AcerInsydeBridge.ResetFans();
             }
@@ -1103,7 +1256,7 @@ namespace AspireSense
             {
                 return DellWmiBridge.SetThermalMode(mode);
             }
-            else if (DetectedVendor == HardwareVendor.Acer)
+            else if (DetectedVendor == HardwareVendor.Acer && AcerInsydeBridge.IsAvailable)
             {
                 return AcerInsydeBridge.SetFanMode(mode);
             }
@@ -1130,7 +1283,7 @@ namespace AspireSense
             {
                 return DellWmiBridge.SetThermalMode(dutyPercentage >= 75 ? 1 : (dutyPercentage <= 45 ? 2 : 0));
             }
-            else if (DetectedVendor == HardwareVendor.Acer)
+            else if (DetectedVendor == HardwareVendor.Acer && AcerInsydeBridge.IsAvailable)
             {
                 return AcerInsydeBridge.SetCustomSpeed(dutyPercentage);
             }
@@ -1270,13 +1423,16 @@ namespace AspireSense
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature"))
                 {
-                    foreach (ManagementObject obj in s.Get())
+                    using (ManagementObjectCollection coll = s.Get())
                     {
-                        using (obj)
+                        foreach (ManagementObject obj in coll)
                         {
-                            double kelvin10 = Convert.ToDouble(obj["CurrentTemperature"]);
-                            int celsius = (int)((kelvin10 / 10.0) - 273.15);
-                            if (celsius >= 20 && celsius <= 115) return celsius;
+                            using (obj)
+                            {
+                                double kelvin10 = Convert.ToDouble(obj["CurrentTemperature"]);
+                                int celsius = (int)((kelvin10 / 10.0) - 273.15);
+                                if (celsius >= 20 && celsius <= 115) return celsius;
+                            }
                         }
                     }
                 }
@@ -1991,6 +2147,11 @@ namespace AspireSense
                 if (timer != null)
                 {
                     timer.Stop();
+                }
+                if (cpuCounter != null)
+                {
+                    try { cpuCounter.Dispose(); } catch { }
+                    cpuCounter = null;
                 }
                 HardwareBridge.CloseHardware();
             };
@@ -3972,8 +4133,16 @@ namespace AspireSense
         [STAThread]
         public static void Main()
         {
-            bool createdNew;
-            singleMutex = new System.Threading.Mutex(true, "Global\\AspireSense_SingleInstance_App", out createdNew);
+            bool createdNew = true;
+            try
+            {
+                singleMutex = new System.Threading.Mutex(true, "Local\\AspireSense_SingleInstance_App", out createdNew);
+            }
+            catch
+            {
+                createdNew = true;
+            }
+
             if (!createdNew)
             {
                 MessageBox.Show("AspireSense is already running.", "AspireSense", MessageBoxButton.OK, MessageBoxImage.Information);
