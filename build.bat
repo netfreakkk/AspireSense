@@ -38,4 +38,4 @@ echo   - Portable:  AspireSense-Portable-v1.0.0.zip
 echo   - App:       AspireSense.exe
 echo ========================================================
 echo.
-pause
+if "%~1"=="" pause

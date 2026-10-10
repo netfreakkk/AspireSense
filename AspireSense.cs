@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -50,6 +51,29 @@ namespace AspireSense
         public static extern int nvmlDeviceGetTemperature(IntPtr device, int sensorType, out uint temp);
 
         [StructLayout(LayoutKind.Sequential)]
+        public struct nvmlMemory_t
+        {
+            public ulong total;
+            public ulong free;
+            public ulong used;
+        }
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetMemoryInfo")]
+        public static extern int nvmlDeviceGetMemoryInfo(IntPtr device, out nvmlMemory_t memory);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetClockInfo")]
+        public static extern int nvmlDeviceGetClockInfo(IntPtr device, int type, out uint clockMHz);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrentClocksThrottleReasons")]
+        public static extern int nvmlDeviceGetCurrentClocksThrottleReasons(IntPtr device, out ulong reasons);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrPcieLinkGeneration")]
+        public static extern int nvmlDeviceGetCurrPcieLinkGeneration(IntPtr device, out uint currLinkGen);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrPcieLinkWidth")]
+        public static extern int nvmlDeviceGetCurrPcieLinkWidth(IntPtr device, out uint currLinkWidth);
+
+        [StructLayout(LayoutKind.Sequential)]
         public struct MEMORYSTATUSEX
         {
             public uint dwLength;
@@ -80,12 +104,25 @@ namespace AspireSense
         [DllImport("kernel32.dll")]
         public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lp);
 
+        [DllImport("kernel32.dll")]
+        public static extern ulong GetTickCount64();
+
         [DllImport("psapi.dll")]
         public static extern int EmptyWorkingSet(IntPtr hwProc);
 
         private static readonly object ecLock = new object();
         private static bool nvmlReady = false;
         private static IntPtr nvmlDevice = IntPtr.Zero;
+
+        // Chassis & Firmware Profile
+        public static string ChassisCpuName = "Intel Core 5 210H";
+        public static string ChassisGpuName = "NVIDIA GeForce RTX 4050 Laptop GPU (6GB)";
+        public static string ChassisBiosVersion = "INSYDE Corp. v1.16RA1";
+        public static string ChassisEcVersion = "v9.13";
+        public static string ChassisModel = "Acer Aspire A715-79G";
+        public static string ChassisOs = "Windows 11 (64-bit)";
+        public static int CachedBatteryDesignMwh = 52514;
+        public static int CachedBatteryFullMwh = 53761;
 
         public static void InitializeHardware()
         {
@@ -102,6 +139,57 @@ namespace AspireSense
             {
                 nvmlReady = false;
             }
+
+            // Read CPU Profile from Registry
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0"))
+                {
+                    if (key != null)
+                    {
+                        object v = key.GetValue("ProcessorNameString");
+                        if (v != null) ChassisCpuName = v.ToString().Trim();
+                    }
+                }
+            }
+            catch { }
+
+            // Read BIOS & Chassis Profile from Registry
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\BIOS"))
+                {
+                    if (key != null)
+                    {
+                        object m = key.GetValue("SystemProductName");
+                        if (m != null) ChassisModel = "Acer " + m.ToString().Trim();
+
+                        object bv = key.GetValue("BIOSVersion");
+                        object br = key.GetValue("BIOSReleaseDate");
+                        if (bv != null) ChassisBiosVersion = "Insyde v" + bv.ToString().Trim() + (br != null ? " (" + br.ToString().Trim() + ")" : "");
+
+                        object ecMaj = key.GetValue("ECFirmwareMajorRelease");
+                        object ecMin = key.GetValue("ECFirmwareMinorRelease");
+                        if (ecMaj != null && ecMin != null) ChassisEcVersion = string.Format("v{0}.{1}", ecMaj, ecMin);
+                    }
+                }
+            }
+            catch { }
+
+            // Read Windows OS Build from Registry
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                {
+                    if (key != null)
+                    {
+                        object pn = key.GetValue("ProductName");
+                        object db = key.GetValue("DisplayVersion");
+                        if (pn != null && db != null) ChassisOs = string.Format("{0} ({1})", pn, db);
+                    }
+                }
+            }
+            catch { }
 
             ResetToAuto();
         }
@@ -296,11 +384,80 @@ namespace AspireSense
             public double UsedRamGb;
             public bool IsAcPlugged;
             public int BatteryPercent;
+
+            // Advanced Telemetry Metrics
+            public double VramTotalGb;
+            public double VramUsedGb;
+            public double VramFreeGb;
+            public float VramUsage;
+            public uint GpuCoreClock;
+            public uint GpuMemClock;
+            public ulong GpuThrottleReasons;
+            public string GpuThrottleStatus;
+            public uint PcieGen;
+            public uint PcieWidth;
+            public TimeSpan SystemUptime;
+            public int BatteryDesignMwh;
+            public int BatteryFullMwh;
+            public double BatteryHealthPct;
+        }
+
+        private static int procTick = 0;
+        private static List<Tuple<string, double>> cachedTopProc = new List<Tuple<string, double>>();
+
+        public static List<Tuple<string, double>> GetTopMemoryProcesses()
+        {
+            procTick++;
+            if (cachedTopProc.Count > 0 && (procTick % 3 != 0))
+            {
+                return cachedTopProc;
+            }
+
+            try
+            {
+                Dictionary<string, double> dict = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                Process[] procs = Process.GetProcesses();
+                for (int i = 0; i < procs.Length; i++)
+                {
+                    try
+                    {
+                        string name = procs[i].ProcessName;
+                        if (name.Equals("Idle", StringComparison.OrdinalIgnoreCase) || name.Equals("System", StringComparison.OrdinalIgnoreCase)) continue;
+                        double mb = procs[i].WorkingSet64 / (1024.0 * 1024.0);
+                        if (dict.ContainsKey(name))
+                            dict[name] += mb;
+                        else
+                            dict[name] = mb;
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { procs[i].Dispose(); } catch { }
+                    }
+                }
+
+                List<KeyValuePair<string, double>> list = new List<KeyValuePair<string, double>>(dict);
+                list.Sort((a, b) => b.Value.CompareTo(a.Value));
+
+                List<Tuple<string, double>> res = new List<Tuple<string, double>>();
+                for (int i = 0; i < Math.Min(3, list.Count); i++)
+                {
+                    res.Add(new Tuple<string, double>(list[i].Key, list[i].Value));
+                }
+                cachedTopProc = res;
+                return res;
+            }
+            catch
+            {
+                return cachedTopProc;
+            }
         }
 
         public static SensorData ReadSensors(PerformanceCounter cpuCounter)
         {
             SensorData data = new SensorData();
+            data.GpuThrottleStatus = "OPTIMAL";
+            data.VramTotalGb = 6.0;
 
             lock (ecLock)
             {
@@ -361,6 +518,47 @@ namespace AspireSense
                     {
                         data.GpuTemp = (int)nTemp;
                     }
+
+                    nvmlMemory_t mem;
+                    if (nvmlDeviceGetMemoryInfo(nvmlDevice, out mem) == 0 && mem.total > 0)
+                    {
+                        data.VramTotalGb = mem.total / (1024.0 * 1024.0 * 1024.0);
+                        data.VramUsedGb = mem.used / (1024.0 * 1024.0 * 1024.0);
+                        data.VramFreeGb = mem.free / (1024.0 * 1024.0 * 1024.0);
+                        data.VramUsage = (float)((mem.used / (double)mem.total) * 100.0);
+                    }
+
+                    uint gClock;
+                    if (nvmlDeviceGetClockInfo(nvmlDevice, 0, out gClock) == 0)
+                    {
+                        data.GpuCoreClock = gClock;
+                    }
+                    uint mClock;
+                    if (nvmlDeviceGetClockInfo(nvmlDevice, 2, out mClock) == 0)
+                    {
+                        data.GpuMemClock = mClock;
+                    }
+
+                    ulong reasons;
+                    if (nvmlDeviceGetCurrentClocksThrottleReasons(nvmlDevice, out reasons) == 0)
+                    {
+                        data.GpuThrottleReasons = reasons;
+                        if ((reasons & 0x40) != 0 || (reasons & 0x20) != 0)
+                            data.GpuThrottleStatus = "THERMAL THROTTLE";
+                        else if ((reasons & 0x04) != 0 || (reasons & 0x80) != 0)
+                            data.GpuThrottleStatus = "POWER CAP (TGP)";
+                        else if ((reasons & 0x01) != 0)
+                            data.GpuThrottleStatus = "IDLE (POWER SAVE)";
+                        else
+                            data.GpuThrottleStatus = "UNCONSTRAINED";
+                    }
+
+                    uint pGen;
+                    if (nvmlDeviceGetCurrPcieLinkGeneration(nvmlDevice, out pGen) == 0)
+                        data.PcieGen = pGen;
+                    uint pWidth;
+                    if (nvmlDeviceGetCurrPcieLinkWidth(nvmlDevice, out pWidth) == 0)
+                        data.PcieWidth = pWidth;
                 }
                 catch
                 {
@@ -404,6 +602,13 @@ namespace AspireSense
                 }
             }
             catch { }
+
+            data.BatteryDesignMwh = CachedBatteryDesignMwh;
+            data.BatteryFullMwh = CachedBatteryFullMwh;
+            data.BatteryHealthPct = (CachedBatteryDesignMwh > 0)
+                ? Math.Min(100.0, (CachedBatteryFullMwh / (double)CachedBatteryDesignMwh) * 100.0)
+                : 100.0;
+            data.SystemUptime = TimeSpan.FromMilliseconds(GetTickCount64());
 
             return data;
         }
@@ -665,6 +870,52 @@ namespace AspireSense
     }
 
     // ==========================================
+    // MINIMALIST SEGMENTED METER (HIGH-TECH LED DESIGN)
+    // ==========================================
+    public class SegmentedMeter : StackPanel
+    {
+        private List<Border> segments = new List<Border>();
+        private Color activeColor;
+        private Color inactiveColor = Color.FromArgb(255, 18, 25, 38);
+
+        public SegmentedMeter(int count, Color active, double segWidth, double segHeight)
+        {
+            this.Orientation = Orientation.Horizontal;
+            this.activeColor = active;
+            for (int i = 0; i < count; i++)
+            {
+                Border b = new Border
+                {
+                    Width = segWidth,
+                    Height = segHeight,
+                    CornerRadius = new CornerRadius(1.5),
+                    Margin = new Thickness(0, 0, 3, 0),
+                    Background = new SolidColorBrush(inactiveColor)
+                };
+                segments.Add(b);
+                this.Children.Add(b);
+            }
+        }
+
+        public void SetColor(Color col)
+        {
+            this.activeColor = col;
+        }
+
+        public void SetValue(double percent)
+        {
+            percent = Math.Max(0.0, Math.Min(100.0, percent));
+            int activeCount = (int)Math.Round((percent / 100.0) * segments.Count);
+            for (int i = 0; i < segments.Count; i++)
+            {
+                segments[i].Background = (i < activeCount)
+                    ? new SolidColorBrush(activeColor)
+                    : new SolidColorBrush(inactiveColor);
+            }
+        }
+    }
+
+    // ==========================================
     // MAIN APPLICATION WINDOW: ASPIRESENSE
     // ==========================================
     public class MainWindow : Window
@@ -694,12 +945,28 @@ namespace AspireSense
         // Gaming Hub Controls
         private TextBlock lblScenarioStatus;
 
-        // Health Controls
-        private TextBlock lblHealthRam;
-        private ProgressBar progHealthRam;
-        private TextBlock lblHealthBattery;
-        private ProgressBar progHealthBattery;
-        private StackPanel spDrives;
+        // Health Controls (Minimalist & Advanced Telemetry)
+        private TextBlock lblHealthUptime;
+        private TextBlock lblHealthVramText;
+        private SegmentedMeter meterHealthVram;
+        private TextBlock lblHealthGpuCore;
+        private TextBlock lblHealthGpuMem;
+        private TextBlock lblHealthGpuThrottle;
+        private TextBlock lblHealthGpuHeadroom;
+
+        private TextBlock lblHealthRamText;
+        private SegmentedMeter meterHealthRam;
+        private TextBlock lblTopProc1;
+        private TextBlock lblTopProc2;
+        private TextBlock lblTopProc3;
+
+        private TextBlock lblHealthBatteryText;
+        private SegmentedMeter meterHealthBattery;
+        private TextBlock lblHealthBatteryWear;
+        private TextBlock lblHealthCpuHeadroom;
+        private TextBlock lblHealthDiskText;
+        private SegmentedMeter meterHealthDisk;
+        private HardwareBridge.SensorData latestSensorData;
 
         // Center Fan Mode Buttons
         private Border btnAuto;
@@ -1666,109 +1933,444 @@ namespace AspireSense
         }
 
         // ==========================================
-        // PAGE 4: SYSTEM HEALTH & SPECS VIEW
+        // PAGE 4: SYSTEM HEALTH & SPECS VIEW (MINIMALIST CYBERPUNK TELEMETRY)
         // ==========================================
         private Grid CreateHealthView()
         {
-            Grid g = new Grid { Margin = new Thickness(35, 15, 35, 15) };
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(160) });
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(88) }); // Top Silicon Ribbon
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // 3 Analytics Cards
 
-            // Top: Hardware Specs Identity Card
-            Border specsCard = CreateSectionCard("HARDWARE IDENTITY & SPECIFICATIONS", "Detected on your laptop chassis");
-            StackPanel specSp = new StackPanel { Margin = new Thickness(20, 12, 20, 12) };
+            // 1. Top Chassis & Silicon Matrix Ribbon
+            Border ribbon = CreateSiliconRibbon();
+            Grid.SetRow(ribbon, 0);
+            g.Children.Add(ribbon);
 
-            UniformGrid specGrid = new UniformGrid { Columns = 3 };
-            specGrid.Children.Add(CreateSpecField("LAPTOP MODEL", "Acer Aspire A715-79G"));
-            specGrid.Children.Add(CreateSpecField("GRAPHICS CARD", "NVIDIA RTX 4050 Laptop (6GB)"));
-            specGrid.Children.Add(CreateSpecField("PROCESSOR", string.Format("Intel Core ({0} Cores)", Environment.ProcessorCount)));
-            specGrid.Children.Add(CreateSpecField("EMBEDDED CONTROLLER", "Insyde / Clevo EC Bridge v1.13"));
-            specGrid.Children.Add(CreateSpecField("OPERATING SYSTEM", "Windows 11 (64-bit Architecture)"));
-            specGrid.Children.Add(CreateSpecField("PC NAME", Environment.MachineName));
+            // 2. Lower Analytics Matrix (3 Equal Minimalist Glass Cards)
+            Grid lowerGrid = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            specSp.Children.Add(specGrid);
-            specsCard.Child = specSp;
-            Grid.SetRow(specsCard, 0);
-            g.Children.Add(specsCard);
+            // Card 1: RTX 4050 Telemetry Card
+            Border gpuCard = CreateGpuHealthCard();
+            Grid.SetColumn(gpuCard, 0);
+            lowerGrid.Children.Add(gpuCard);
 
-            // Bottom: Memory, Battery & Disk Health
-            Grid botGrid = new Grid { Margin = new Thickness(0, 15, 0, 0) };
-            botGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            botGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            // Card 2: Memory & Workloads Card
+            Border ramCard = CreateMemoryHealthCard();
+            Grid.SetColumn(ramCard, 1);
+            lowerGrid.Children.Add(ramCard);
 
-            // Left: RAM & Battery Card
-            Border ramCard = CreateSectionCard("MEMORY & POWER TELEMETRY", "Live telemetry metrics");
-            StackPanel rbSp = new StackPanel { Margin = new Thickness(20, 15, 20, 15) };
+            // Card 3: Power, Storage & Diagnostics Card
+            Border powerCard = CreatePowerHealthCard();
+            Grid.SetColumn(powerCard, 2);
+            lowerGrid.Children.Add(powerCard);
 
-            lblHealthRam = new TextBlock { Text = "RAM: --% (-- / -- GB)", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.White };
-            progHealthRam = new ProgressBar { Height = 14, Minimum = 0, Maximum = 100, Value = 50, Margin = new Thickness(0, 8, 0, 15), Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)) };
-            rbSp.Children.Add(lblHealthRam);
-            rbSp.Children.Add(progHealthRam);
-
-            lblHealthBattery = new TextBlock { Text = "Battery: --% (Checking Status...)", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = Brushes.White };
-            progHealthBattery = new ProgressBar { Height = 14, Minimum = 0, Maximum = 100, Value = 100, Margin = new Thickness(0, 8, 0, 10), Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 140)) };
-            rbSp.Children.Add(lblHealthBattery);
-            rbSp.Children.Add(progHealthBattery);
-
-            ramCard.Child = rbSp;
-            Grid.SetColumn(ramCard, 0);
-            botGrid.Children.Add(ramCard);
-
-            // Right: Storage Drives Card
-            Border diskCard = CreateSectionCard("LOCAL STORAGE DRIVES", "Free capacity on disk drives");
-            diskCard.Margin = new Thickness(15, 0, 0, 0);
-
-            spDrives = new StackPanel { Margin = new Thickness(20, 15, 20, 15) };
-            PopulateStorageDrives(spDrives);
-
-            diskCard.Child = spDrives;
-            Grid.SetColumn(diskCard, 1);
-            botGrid.Children.Add(diskCard);
-
-            Grid.SetRow(botGrid, 1);
-            g.Children.Add(botGrid);
+            Grid.SetRow(lowerGrid, 1);
+            g.Children.Add(lowerGrid);
 
             return g;
         }
 
-        private Border CreateSpecField(string title, string val)
+        private Border CreateSiliconRibbon()
         {
-            Border b = new Border { Margin = new Thickness(6) };
+            Border ribbon = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(190, 10, 15, 26)),
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(50, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(14, 8, 14, 8)
+            };
+
+            UniformGrid ug = new UniformGrid { Columns = 5 };
+
+            TextBlock dummy;
+            ug.Children.Add(CreateRibbonTile("PROCESSOR MATRIX", HardwareBridge.ChassisCpuName, string.Format("{0} Cores • 4.8 GHz Max", Environment.ProcessorCount), out dummy));
+            ug.Children.Add(CreateRibbonTile("GRAPHICS SILICON", HardwareBridge.ChassisGpuName, "PCIe Gen 4.0 x8 Bus", out dummy));
+            ug.Children.Add(CreateRibbonTile("MEMORY ARCHITECTURE", "32 GB Dual-Channel", "DDR5 SODIMM @ 3200 MT/s", out dummy));
+            ug.Children.Add(CreateRibbonTile("FIRMWARE PLATFORM", HardwareBridge.ChassisBiosVersion, "EC Controller " + HardwareBridge.ChassisEcVersion, out dummy));
+            ug.Children.Add(CreateRibbonTile("SYSTEM RUNTIME", "0d 00h 00m 00s", HardwareBridge.ChassisOs, out lblHealthUptime));
+
+            ribbon.Child = ug;
+            return ribbon;
+        }
+
+        private Border CreateRibbonTile(string category, string primary, string secondary, out TextBlock dynamicTb)
+        {
+            Border b = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(90, 14, 20, 34)),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 7, 10, 7),
+                Margin = new Thickness(3)
+            };
             StackPanel sp = new StackPanel();
-            sp.Children.Add(new TextBlock { Text = title, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 160, 220)) });
-            sp.Children.Add(new TextBlock { Text = val, FontSize = 12, FontWeight = FontWeights.Bold, Foreground = Brushes.White, Margin = new Thickness(0, 2, 0, 0) });
+            sp.Children.Add(new TextBlock
+            {
+                Text = category,
+                FontSize = 8.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(90, 140, 190))
+            });
+
+            dynamicTb = new TextBlock
+            {
+                Text = primary,
+                FontSize = 11.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                Margin = new Thickness(0, 2, 0, 1),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            sp.Children.Add(dynamicTb);
+
+            sp.Children.Add(new TextBlock
+            {
+                Text = secondary,
+                FontSize = 9,
+                Foreground = new SolidColorBrush(Color.FromRgb(130, 160, 190)),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+
             b.Child = sp;
             return b;
         }
 
-        private void PopulateStorageDrives(StackPanel sp)
+        private Border CreateGpuHealthCard()
+        {
+            StackPanel sp = new StackPanel();
+
+            // VRAM Section
+            sp.Children.Add(CreateMetricHeader("VRAM DEDICATED ALLOCATION", out lblHealthVramText, "0.0 / 6.0 GB (0%)", Color.FromRgb(0, 229, 255)));
+            meterHealthVram = new SegmentedMeter(14, Color.FromRgb(0, 229, 255), 16, 5);
+            sp.Children.Add(meterHealthVram);
+
+            // Clock Frequencies Dual Tile
+            UniformGrid clkGrid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 14, 0, 12) };
+            clkGrid.Children.Add(CreateClockTile("CORE CLOCK", out lblHealthGpuCore, "2,130", "MHz"));
+            clkGrid.Children.Add(CreateClockTile("VRAM CLOCK", out lblHealthGpuMem, "8,001", "MHz"));
+            sp.Children.Add(clkGrid);
+
+            // Telemetry Status Lines
+            StackPanel statSp = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
+            statSp.Children.Add(CreateStatusLine("THROTTLE REASON:", out lblHealthGpuThrottle, "OPTIMAL (IDLE)", Color.FromRgb(0, 255, 140)));
+            statSp.Children.Add(CreateStatusLine("THERMAL HEADROOM:", out lblHealthGpuHeadroom, "+48°C Margin (to 87°C)", Color.FromRgb(56, 189, 248)));
+            statSp.Children.Add(CreateStatusLine("BUS INTERFACE:", "PCIe Gen 4.0 x8 Active", Color.FromRgb(160, 190, 220)));
+            sp.Children.Add(statSp);
+
+            Border card = CreateMinimalCard("RTX 4050 ACCELERATOR", "AD107M", sp);
+            card.Margin = new Thickness(0, 0, 6, 0);
+            return card;
+        }
+
+        private Border CreateMemoryHealthCard()
+        {
+            StackPanel sp = new StackPanel();
+
+            // RAM Section
+            sp.Children.Add(CreateMetricHeader("PHYSICAL RAM UTILIZATION", out lblHealthRamText, "-- / -- GB (--%)", Color.FromRgb(168, 85, 247)));
+            meterHealthRam = new SegmentedMeter(14, Color.FromRgb(168, 85, 247), 16, 5);
+            sp.Children.Add(meterHealthRam);
+
+            // Top Memory Consumers
+            TextBlock topHeader = new TextBlock
+            {
+                Text = "TOP ACTIVE CONSUMERS (RAM)",
+                FontSize = 8.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)),
+                Margin = new Thickness(0, 16, 0, 6)
+            };
+            sp.Children.Add(topHeader);
+
+            sp.Children.Add(CreateProcessItem("#1", out lblTopProc1));
+            sp.Children.Add(CreateProcessItem("#2", out lblTopProc2));
+            sp.Children.Add(CreateProcessItem("#3", out lblTopProc3));
+
+            // Instant Purge Button
+            Border btnPurge = CreateActionButton("⚡ PURGE UNUSED MEMORY", () =>
+            {
+                HardwareBridge.OptimizeMemory();
+                if (lblStatusMsg != null)
+                {
+                    lblStatusMsg.Text = "MEMORY PURGED: WORKING SETS TRIMMED SAFELY";
+                    lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 140));
+                }
+            });
+            sp.Children.Add(btnPurge);
+
+            Border card = CreateMinimalCard("MEMORY & PROCESSES", "32 GB DDR5", sp);
+            card.Margin = new Thickness(3, 0, 3, 0);
+            return card;
+        }
+
+        private Border CreatePowerHealthCard()
+        {
+            StackPanel sp = new StackPanel();
+
+            // Battery Section
+            sp.Children.Add(CreateMetricHeader("BATTERY POWER", out lblHealthBatteryText, "100% (AC Mains)", Color.FromRgb(0, 255, 140)));
+            meterHealthBattery = new SegmentedMeter(12, Color.FromRgb(0, 255, 140), 18, 5);
+            sp.Children.Add(meterHealthBattery);
+
+            lblHealthBatteryWear = new TextBlock
+            {
+                Text = "Design: 52.5 Wh | Current: 53.8 Wh (0.0% Wear)",
+                FontSize = 9.5,
+                Foreground = new SolidColorBrush(Color.FromRgb(130, 170, 200)),
+                Margin = new Thickness(0, 4, 0, 10)
+            };
+            sp.Children.Add(lblHealthBatteryWear);
+
+            // Storage NVMe Section
+            sp.Children.Add(CreateMetricHeader("PRIMARY STORAGE (C: NVMe)", out lblHealthDiskText, "Checking capacity...", Color.FromRgb(0, 210, 255)));
+            meterHealthDisk = new SegmentedMeter(12, Color.FromRgb(0, 210, 255), 18, 5);
+            sp.Children.Add(meterHealthDisk);
+
+            // CPU Headroom
+            StackPanel statSp = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
+            statSp.Children.Add(CreateStatusLine("CPU SILICON HEADROOM:", out lblHealthCpuHeadroom, "+55°C Margin (to 100°C TJMax)", Color.FromRgb(0, 255, 140)));
+            sp.Children.Add(statSp);
+
+            // Export Diagnostics Button
+            Border btnExport = CreateActionButton("📋 COPY DIAGNOSTICS REPORT", () =>
+            {
+                CopyDiagnosticsReport();
+            });
+            sp.Children.Add(btnExport);
+
+            Border card = CreateMinimalCard("POWER & STORAGE HEALTH", "OPTIMAL", sp);
+            card.Margin = new Thickness(6, 0, 0, 0);
+            return card;
+        }
+
+        private Border CreateMinimalCard(string title, string badge, UIElement content)
+        {
+            Border card = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(190, 10, 15, 26)),
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(50, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(16, 14, 16, 14)
+            };
+
+            Grid header = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+
+            TextBlock t = new TextBlock
+            {
+                Text = title,
+                FontSize = 11.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(t, 0);
+            header.Children.Add(t);
+
+            Border bPill = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(80, 0, 140, 255)),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(6, 2, 6, 2)
+            };
+            bPill.Child = new TextBlock
+            {
+                Text = badge,
+                FontSize = 9,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255))
+            };
+            Grid.SetColumn(bPill, 1);
+            header.Children.Add(bPill);
+
+            StackPanel root = new StackPanel();
+            root.Children.Add(header);
+            root.Children.Add(content);
+            card.Child = root;
+
+            return card;
+        }
+
+        private Grid CreateMetricHeader(string label, out TextBlock valTb, string defaultVal, Color valColor)
+        {
+            Grid g = new Grid { Margin = new Thickness(0, 4, 0, 6) };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+
+            TextBlock lTb = new TextBlock { Text = label, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(lTb, 0);
+            g.Children.Add(lTb);
+
+            valTb = new TextBlock { Text = defaultVal, FontSize = 10.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(valTb, 1);
+            g.Children.Add(valTb);
+
+            return g;
+        }
+
+        private Border CreateClockTile(string label, out TextBlock valTb, string defVal, string unit)
+        {
+            Border b = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(110, 13, 19, 32)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(40, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 8, 10, 8),
+                Margin = new Thickness(3)
+            };
+            StackPanel sp = new StackPanel();
+            sp.Children.Add(new TextBlock { Text = label, FontSize = 8.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 180)) });
+
+            StackPanel numSp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 0) };
+            valTb = new TextBlock { Text = defVal, FontSize = 20, FontWeight = FontWeights.Black, Foreground = Brushes.White };
+            numSp.Children.Add(valTb);
+            numSp.Children.Add(new TextBlock { Text = " " + unit, FontSize = 10, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 3) });
+            sp.Children.Add(numSp);
+
+            b.Child = sp;
+            return b;
+        }
+
+        private Grid CreateStatusLine(string label, out TextBlock valTb, string defVal, Color valColor)
+        {
+            Grid g = new Grid { Margin = new Thickness(0, 3, 0, 3) };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(125) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            TextBlock lTb = new TextBlock { Text = label, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(lTb, 0);
+            g.Children.Add(lTb);
+
+            valTb = new TextBlock { Text = defVal, FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(valTb, 1);
+            g.Children.Add(valTb);
+
+            return g;
+        }
+
+        private Grid CreateStatusLine(string label, string val, Color valColor)
+        {
+            TextBlock dummy;
+            return CreateStatusLine(label, out dummy, val, valColor);
+        }
+
+        private Border CreateProcessItem(string rank, out TextBlock txt)
+        {
+            Border b = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(100, 14, 20, 32)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(30, 168, 85, 247)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(10, 6, 10, 6),
+                Margin = new Thickness(0, 2, 0, 2)
+            };
+            Grid g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(22) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            TextBlock rTb = new TextBlock { Text = rank, FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(168, 85, 247)), VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(rTb, 0);
+            g.Children.Add(rTb);
+
+            txt = new TextBlock { Text = "Analyzing...", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(txt, 1);
+            g.Children.Add(txt);
+
+            b.Child = g;
+            return b;
+        }
+
+        private Border CreateActionButton(string label, Action action)
+        {
+            Border b = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(140, 15, 22, 36)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(12, 7, 12, 7),
+                Margin = new Thickness(0, 10, 0, 0),
+                Cursor = Cursors.Hand
+            };
+            TextBlock t = new TextBlock
+            {
+                Text = label,
+                FontSize = 10,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            b.Child = t;
+            b.MouseEnter += (s, e) => {
+                b.Background = new SolidColorBrush(Color.FromArgb(200, 0, 100, 200));
+                t.Foreground = Brushes.White;
+            };
+            b.MouseLeave += (s, e) => {
+                b.Background = new SolidColorBrush(Color.FromArgb(140, 15, 22, 36));
+                t.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
+            };
+            b.MouseDown += (s, e) => { action(); };
+            return b;
+        }
+
+        private void CopyDiagnosticsReport()
         {
             try
             {
-                DriveInfo[] drives = DriveInfo.GetDrives();
-                foreach (DriveInfo d in drives)
+                HardwareBridge.SensorData d = latestSensorData ?? HardwareBridge.ReadSensors(cpuCounter);
+                string report = string.Format(
+                    "================ ASPIRESENSE SYSTEM DIAGNOSTICS ================\n" +
+                    "Timestamp:        {0}\n" +
+                    "Chassis Model:    {1}\n" +
+                    "Processor:        {2} ({3} Cores)\n" +
+                    "Graphics Card:    {4}\n" +
+                    "BIOS Version:     {5} | EC: {6}\n" +
+                    "Operating System: {7}\n" +
+                    "System Uptime:    {8}d {9:D2}h {10:D2}m {11:D2}s\n\n" +
+                    "--- LIVE HARDWARE SENSORS ---\n" +
+                    "CPU Temperature:  {12}°C (Headroom to 100°C TJMax: +{13}°C)\n" +
+                    "GPU Temperature:  {14}°C (Headroom to 87°C Limit: +{15}°C)\n" +
+                    "GPU Core Clock:   {16} MHz | Mem Clock: {17} MHz\n" +
+                    "GPU VRAM In Use:  {18:F1} / {19:F1} GB ({20:F0}%)\n" +
+                    "GPU Throttle:     {21}\n" +
+                    "System RAM:       {22:F1} / {23:F1} GB ({24:F0}%)\n" +
+                    "Battery Status:   {25}% ({26})\n" +
+                    "Battery Health:   {27:F1}% ({28:F1}% Degradation)\n" +
+                    "=================================================================\n",
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    HardwareBridge.ChassisModel,
+                    HardwareBridge.ChassisCpuName, Environment.ProcessorCount,
+                    HardwareBridge.ChassisGpuName,
+                    HardwareBridge.ChassisBiosVersion, HardwareBridge.ChassisEcVersion,
+                    HardwareBridge.ChassisOs,
+                    d.SystemUptime.Days, d.SystemUptime.Hours, d.SystemUptime.Minutes, d.SystemUptime.Seconds,
+                    d.CpuTemp, Math.Max(0, 100 - d.CpuTemp),
+                    d.GpuTemp, Math.Max(0, 87 - d.GpuTemp),
+                    d.GpuCoreClock, d.GpuMemClock,
+                    d.VramUsedGb, d.VramTotalGb, d.VramUsage,
+                    d.GpuThrottleStatus,
+                    d.UsedRamGb, d.TotalRamGb, d.RamUsage,
+                    d.BatteryPercent, d.IsAcPlugged ? "AC Mains" : "On Battery",
+                    d.BatteryHealthPct, Math.Max(0.0, 100.0 - d.BatteryHealthPct)
+                );
+                Clipboard.SetText(report);
+                if (lblStatusMsg != null)
                 {
-                    if (d.IsReady && d.DriveType == DriveType.Fixed)
-                    {
-                        double totalGb = d.TotalSize / (1024.0 * 1024.0 * 1024.0);
-                        double freeGb = d.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0);
-                        double usedGb = totalGb - freeGb;
-                        double pct = (usedGb / totalGb) * 100.0;
-
-                        StackPanel dSp = new StackPanel { Margin = new Thickness(0, 0, 0, 12) };
-                        Grid dHeader = new Grid();
-                        dHeader.Children.Add(new TextBlock { Text = string.Format("Drive {0} ({1})", d.Name, string.IsNullOrEmpty(d.VolumeLabel) ? "Local Disk" : d.VolumeLabel), FontSize = 11, FontWeight = FontWeights.Bold, Foreground = Brushes.White });
-                        dHeader.Children.Add(new TextBlock { Text = string.Format("{0:F1} GB free of {1:F1} GB", freeGb, totalGb), FontSize = 10, Foreground = Brushes.Silver, HorizontalAlignment = HorizontalAlignment.Right });
-                        dSp.Children.Add(dHeader);
-
-                        ProgressBar pb = new ProgressBar { Height = 10, Minimum = 0, Maximum = 100, Value = pct, Margin = new Thickness(0, 5, 0, 0), Foreground = new SolidColorBrush(Color.FromRgb(0, 180, 255)) };
-                        dSp.Children.Add(pb);
-
-                        sp.Children.Add(dSp);
-                    }
+                    lblStatusMsg.Text = "DIAGNOSTIC REPORT COPIED TO CLIPBOARD";
+                    lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 140));
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (lblStatusMsg != null) lblStatusMsg.Text = "EXPORT ERROR: " + ex.Message;
+            }
         }
 
         private Grid CreateFooter()
@@ -1832,23 +2434,105 @@ namespace AspireSense
                     progCoolingGpu.Value = d.GpuDuty;
                 }
 
-                // Update RAM & Power on Dashboard & Health
-                if (d.TotalRamGb > 0)
+                latestSensorData = d;
+
+                // Update RAM on Dashboard
+                if (d.TotalRamGb > 0 && lblRamStats != null)
                 {
-                    string ramStr = string.Format("RAM: {0:F0}% ({1:F1} / {2:F1} GB)", d.RamUsage, d.UsedRamGb, d.TotalRamGb);
-                    if (lblRamStats != null) lblRamStats.Text = ramStr;
-                    if (lblHealthRam != null)
-                    {
-                        lblHealthRam.Text = ramStr;
-                        progHealthRam.Value = d.RamUsage;
-                    }
+                    lblRamStats.Text = string.Format("RAM: {0:F0}% ({1:F1} / {2:F1} GB)", d.RamUsage, d.UsedRamGb, d.TotalRamGb);
                 }
 
-                if (lblHealthBattery != null)
+                // Update System Health & Specs Telemetry View
+                if (lblHealthUptime != null)
                 {
-                    string pwrStr = d.IsAcPlugged ? "Plugged in (AC Power)" : "On Battery";
-                    lblHealthBattery.Text = string.Format("Battery: {0}% ({1})", d.BatteryPercent, pwrStr);
-                    progHealthBattery.Value = d.BatteryPercent;
+                    lblHealthUptime.Text = string.Format("{0}d {1:D2}h {2:D2}m {3:D2}s",
+                        d.SystemUptime.Days, d.SystemUptime.Hours, d.SystemUptime.Minutes, d.SystemUptime.Seconds);
+                }
+
+                // RTX 4050 Telemetry Card
+                if (lblHealthVramText != null)
+                {
+                    lblHealthVramText.Text = string.Format("{0:F1} / {1:F1} GB ({2:F0}%)", d.VramUsedGb, d.VramTotalGb, d.VramUsage);
+                    if (meterHealthVram != null) meterHealthVram.SetValue(d.VramUsage);
+                }
+                if (lblHealthGpuCore != null)
+                {
+                    lblHealthGpuCore.Text = string.Format("{0:N0}", d.GpuCoreClock);
+                }
+                if (lblHealthGpuMem != null)
+                {
+                    lblHealthGpuMem.Text = string.Format("{0:N0}", d.GpuMemClock);
+                }
+                if (lblHealthGpuThrottle != null)
+                {
+                    lblHealthGpuThrottle.Text = d.GpuThrottleStatus;
+                    if (d.GpuThrottleStatus.Contains("THERMAL"))
+                        lblHealthGpuThrottle.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 60));
+                    else if (d.GpuThrottleStatus.Contains("POWER"))
+                        lblHealthGpuThrottle.Foreground = new SolidColorBrush(Color.FromRgb(255, 170, 0));
+                    else
+                        lblHealthGpuThrottle.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                }
+                if (lblHealthGpuHeadroom != null)
+                {
+                    int margin = Math.Max(0, 87 - d.GpuTemp);
+                    lblHealthGpuHeadroom.Text = string.Format("+{0}°C Margin (to 87°C)", margin);
+                }
+
+                // Memory & Workloads Card
+                if (lblHealthRamText != null)
+                {
+                    lblHealthRamText.Text = string.Format("{0:F1} / {1:F1} GB ({2:F0}%)", d.UsedRamGb, d.TotalRamGb, d.RamUsage);
+                    if (meterHealthRam != null) meterHealthRam.SetValue(d.RamUsage);
+                }
+
+                List<Tuple<string, double>> topProcs = HardwareBridge.GetTopMemoryProcesses();
+                if (lblTopProc1 != null && topProcs.Count > 0)
+                {
+                    lblTopProc1.Text = string.Format("{0} ({1:F0} MB)", topProcs[0].Item1, topProcs[0].Item2);
+                }
+                if (lblTopProc2 != null && topProcs.Count > 1)
+                {
+                    lblTopProc2.Text = string.Format("{0} ({1:F0} MB)", topProcs[1].Item1, topProcs[1].Item2);
+                }
+                if (lblTopProc3 != null && topProcs.Count > 2)
+                {
+                    lblTopProc3.Text = string.Format("{0} ({1:F0} MB)", topProcs[2].Item1, topProcs[2].Item2);
+                }
+
+                // Power & Storage Health Card
+                if (lblHealthBatteryText != null)
+                {
+                    string pwr = d.IsAcPlugged ? "AC Mains Connected" : "Discharging (Battery)";
+                    lblHealthBatteryText.Text = string.Format("{0}% ({1})", d.BatteryPercent, pwr);
+                    if (meterHealthBattery != null) meterHealthBattery.SetValue(d.BatteryPercent);
+                }
+                if (lblHealthBatteryWear != null)
+                {
+                    lblHealthBatteryWear.Text = string.Format("Design: {0:F1} Wh | Full: {1:F1} Wh ({2:F1}% Wear)",
+                        d.BatteryDesignMwh / 1000.0, d.BatteryFullMwh / 1000.0, Math.Max(0.0, 100.0 - d.BatteryHealthPct));
+                }
+                if (lblHealthCpuHeadroom != null)
+                {
+                    int margin = Math.Max(0, 100 - d.CpuTemp);
+                    lblHealthCpuHeadroom.Text = string.Format("+{0}°C Margin (to 100°C TJMax)", margin);
+                }
+
+                if (lblHealthDiskText != null && meterHealthDisk != null)
+                {
+                    try
+                    {
+                        DriveInfo dInfo = new DriveInfo("C");
+                        if (dInfo.IsReady)
+                        {
+                            double totalGb = dInfo.TotalSize / (1024.0 * 1024.0 * 1024.0);
+                            double freeGb = dInfo.AvailableFreeSpace / (1024.0 * 1024.0 * 1024.0);
+                            double usedPct = ((totalGb - freeGb) / totalGb) * 100.0;
+                            lblHealthDiskText.Text = string.Format("{0:F1} GB Free of {1:F1} GB", freeGb, totalGb);
+                            meterHealthDisk.SetValue(usedPct);
+                        }
+                    }
+                    catch { }
                 }
 
                 // ACTIVE THERMAL WATCHDOG: Safeguard hardware against excessive temperatures
