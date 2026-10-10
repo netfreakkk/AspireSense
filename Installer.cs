@@ -215,6 +215,14 @@ namespace AspireSenseInstaller
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(50) });
 
             // Header info
+            string detectedMfg = DetectChassisManufacturer();
+            string mfgDetail = "Universal Native Windows Driver Stack (Zero external DLLs needed)";
+            if (detectedMfg == "Acer") mfgDetail = "Acer Insyde H2O EC Hardware Stack (InsydeDCHU.dll deployed)";
+            else if (detectedMfg == "ASUS") mfgDetail = "ASUS Direct ACPI Stack (Native Windows Driver, Zero 3rd-party DLLs)";
+            else if (detectedMfg == "Lenovo") mfgDetail = "Lenovo Vantage ACPI/WMI Stack (Native Windows Driver, Zero 3rd-party DLLs)";
+            else if (detectedMfg == "HP") mfgDetail = "HP Omen WMI Bios Stack (Native Windows Driver, Zero 3rd-party DLLs)";
+            else if (detectedMfg == "Dell") mfgDetail = "Dell Alienware/G-Series WMAX Stack (Native Windows Driver, Zero 3rd-party DLLs)";
+
             StackPanel headerSp = new StackPanel();
             TextBlock title = new TextBlock
             {
@@ -225,13 +233,33 @@ namespace AspireSenseInstaller
             };
             TextBlock sub = new TextBlock
             {
-                Text = "Standalone hardware cooling control and live thermal monitor tailored for Acer Aspire laptops.",
+                Text = "Open-source hardware fan control & telemetry cockpit for gaming laptops (Acer, ASUS, Lenovo, HP, Dell).",
                 FontSize = 11,
                 Foreground = new SolidColorBrush(Color.FromRgb(150, 180, 220)),
-                Margin = new Thickness(0, 4, 0, 0)
+                Margin = new Thickness(0, 3, 0, 0)
             };
+
+            Border hwPill = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(90, 0, 160, 255)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(140, 0, 210, 255)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(8, 3, 8, 3),
+                Margin = new Thickness(0, 6, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            hwPill.Child = new TextBlock
+            {
+                Text = "DETECTED PLATFORM: " + detectedMfg.ToUpperInvariant() + " | " + mfgDetail,
+                FontSize = 9,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 240, 255))
+            };
+
             headerSp.Children.Add(title);
             headerSp.Children.Add(sub);
+            headerSp.Children.Add(hwPill);
             Grid.SetRow(headerSp, 0);
             g.Children.Add(headerSp);
 
@@ -574,7 +602,7 @@ namespace AspireSenseInstaller
             Grid f = new Grid { Background = new SolidColorBrush(Color.FromRgb(8, 11, 20)) };
             TextBlock t = new TextBlock
             {
-                Text = "AspireSense 2026 | Built for Acer Aspire 7 (RTX 4050) & Compatible Laptops | github.com/netfreakkk/AspireSense",
+                Text = "AspireSense 2026 | Universal Fan Control & Telemetry (Acer, ASUS, Lenovo, HP, Dell) | github.com/netfreakkk/AspireSense",
                 FontSize = 9.5,
                 Foreground = new SolidColorBrush(Color.FromRgb(100, 130, 170)),
                 VerticalAlignment = VerticalAlignment.Center,
@@ -637,6 +665,31 @@ namespace AspireSenseInstaller
             t.Start();
         }
 
+        private static string DetectChassisManufacturer()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\BIOS"))
+                {
+                    if (key != null)
+                    {
+                        string mfg = (key.GetValue("SystemManufacturer") ?? "").ToString();
+                        string board = (key.GetValue("BaseBoardManufacturer") ?? "").ToString();
+                        string prod = (key.GetValue("SystemProductName") ?? "").ToString();
+                        string combined = (mfg + " " + board + " " + prod).ToLowerInvariant();
+
+                        if (combined.Contains("asus") || combined.Contains("tuf") || combined.Contains("rog")) return "ASUS";
+                        if (combined.Contains("lenovo") || combined.Contains("legion") || combined.Contains("ideapad") || combined.Contains("loq")) return "Lenovo";
+                        if (combined.Contains("hp") || combined.Contains("hewlett") || combined.Contains("omen") || combined.Contains("victus")) return "HP";
+                        if (combined.Contains("dell") || combined.Contains("alienware")) return "Dell";
+                        if (combined.Contains("acer") || combined.Contains("aspire") || combined.Contains("nitro") || combined.Contains("predator")) return "Acer";
+                    }
+                }
+            }
+            catch { }
+            return "Universal";
+        }
+
         private void DoInstallWork(string installDir, bool makeDesktop, bool makeStartMenu, bool enableStartup)
         {
             try
@@ -648,8 +701,23 @@ namespace AspireSenseInstaller
                 }
                 Thread.Sleep(300);
 
-                // Extract Embedded Files
-                string[] filesToExtract = new string[] { "AspireSense.exe", "InsydeDCHU.dll", "logo.png", "app.ico", "README.md", "LICENSE" };
+                string detectedMfg = DetectChassisManufacturer();
+                UpdateProgress(20, "Detecting Hardware Architecture...", "Target: " + detectedMfg + " (Tailoring deployment payload)");
+                Thread.Sleep(200);
+
+                // Extract Embedded Files - conditionally load InsydeDCHU.dll only if Acer hardware is detected!
+                List<string> filesList = new List<string>();
+                filesList.Add("AspireSense.exe");
+                if (detectedMfg == "Acer")
+                {
+                    filesList.Add("InsydeDCHU.dll");
+                }
+                filesList.Add("logo.png");
+                filesList.Add("app.ico");
+                filesList.Add("README.md");
+                filesList.Add("LICENSE");
+
+                string[] filesToExtract = filesList.ToArray();
                 Assembly asm = Assembly.GetExecutingAssembly();
 
                 for (int i = 0; i < filesToExtract.Length; i++)
