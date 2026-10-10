@@ -1,5 +1,6 @@
 /target:winexe
 /platform:x64
+/win32manifest:app.manifest
 /win32icon:app.ico
 /out:AspireSense-Setup.exe
 /resource:AspireSense.exe,AspireSense.exe

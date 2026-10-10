@@ -8,7 +8,7 @@ echo ========================================================
 echo.
 
 echo [1/3] Compiling AspireSense Application (AspireSense.exe)...
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /platform:x64 /win32icon:"%~dp0app.ico" /out:"%~dp0AspireSense.exe" /r:System.dll,System.Xaml.dll,"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Management.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationFramework.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll" "%~dp0AspireSense.cs"
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /platform:x64 /win32manifest:"%~dp0app.manifest" /win32icon:"%~dp0app.ico" /out:"%~dp0AspireSense.exe" /r:System.dll,System.Xaml.dll,"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Management.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationFramework.dll","C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll" "%~dp0AspireSense.cs"
 if %errorlevel% neq 0 (
     echo [FAILED] Application compilation failed.
     pause
