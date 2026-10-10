@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Management;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using Microsoft.Win32;
 using System.Windows;
@@ -17,6 +19,367 @@ using Path = System.Windows.Shapes.Path;
 
 namespace AspireSense
 {
+    public enum HardwareVendor
+    {
+        AcerAspire,
+        AsusTuf,
+        Universal
+    }
+
+    // ==========================================
+    // ASUS ACPI / WMI DIRECT HARDWARE BRIDGE
+    // Native communication with ASUS TUF Gaming & ROG laptops (ATKACPI / AsusAtkWmi_WMNB)
+    // Zero external dependencies: uses Win32 DeviceIoControl and System.Management
+    // ==========================================
+    public static class AsusAcpiBridge
+    {
+        private const string FILE_NAME = @"\\.\ATKACPI";
+        private const uint CONTROL_CODE = 0x0022240C;
+
+        private const uint DSTS = 0x53545344;
+        private const uint DEVS = 0x53564544;
+        private const uint INIT = 0x54494E49;
+
+        // ASUS Hardware Endpoints
+        public const uint PerformanceMode = 0x00120075; // TUF / ROG Performance modes (0=Balanced, 1=Turbo, 2=Silent)
+        public const uint VivoBookMode    = 0x00110019; // Vivobook/Zenbook fallback (0=Standard, 2=Performance, 1=Whisper)
+        public const uint CPU_Fan         = 0x00110013; // CPU Fan status & RPM
+        public const uint GPU_Fan         = 0x00110014; // GPU Fan status & RPM
+        public const uint Mid_Fan         = 0x00110031; // Middle Fan status & RPM
+        public const int  Temp_CPU        = 0x00120094; // CPU Package Temperature
+        public const int  Temp_GPU        = 0x00120097; // GPU Temperature
+        public const uint DevsCPUFanCurve = 0x00110024; // CPU Fan curve points (16 bytes)
+        public const uint DevsGPUFanCurve = 0x00110025; // GPU Fan curve points (16 bytes)
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFile(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            IntPtr hDevice,
+            uint dwIoControlCode,
+            byte[] lpInBuffer,
+            uint nInBufferSize,
+            byte[] lpOutBuffer,
+            uint nOutBufferSize,
+            ref uint lpBytesReturned,
+            IntPtr lpOverlapped
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint GENERIC_READ = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+        private const uint FILE_SHARE_READ = 1;
+        private const uint FILE_SHARE_WRITE = 2;
+
+        private static IntPtr handle = new IntPtr(-1);
+        private static bool isAvailable = false;
+        private static bool isWmiAvailable = false;
+        private static readonly object acpiLock = new object();
+
+        public static bool IsAvailable
+        {
+            get { return isAvailable || isWmiAvailable; }
+        }
+
+        public static bool Initialize()
+        {
+            lock (acpiLock)
+            {
+                try
+                {
+                    handle = CreateFile(
+                        FILE_NAME,
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        IntPtr.Zero,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        IntPtr.Zero
+                    );
+
+                    if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                    {
+                        isAvailable = true;
+                        return true;
+                    }
+                }
+                catch
+                {
+                    handle = new IntPtr(-1);
+                }
+
+                // Fallback: Check if ASUS WMI provider is installed
+                try
+                {
+                    using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
+                    {
+                        ManagementObjectCollection coll = searcher.Get();
+                        if (coll != null && coll.Count > 0)
+                        {
+                            isWmiAvailable = true;
+                            return true;
+                        }
+                    }
+                }
+                catch
+                {
+                    isWmiAvailable = false;
+                }
+
+                return false;
+            }
+        }
+
+        private static byte[] CallMethod(uint methodId, byte[] args)
+        {
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+                return new byte[16];
+
+            byte[] acpiBuf = new byte[8 + args.Length];
+            byte[] outBuffer = new byte[16];
+
+            BitConverter.GetBytes(methodId).CopyTo(acpiBuf, 0);
+            BitConverter.GetBytes((uint)args.Length).CopyTo(acpiBuf, 4);
+            Array.Copy(args, 0, acpiBuf, 8, args.Length);
+
+            uint lpBytesReturned = 0;
+            DeviceIoControl(
+                handle,
+                CONTROL_CODE,
+                acpiBuf,
+                (uint)acpiBuf.Length,
+                outBuffer,
+                (uint)outBuffer.Length,
+                ref lpBytesReturned,
+                IntPtr.Zero
+            );
+
+            return outBuffer;
+        }
+
+        public static int DeviceSet(uint deviceId, int status)
+        {
+            lock (acpiLock)
+            {
+                if (isAvailable && handle != new IntPtr(-1))
+                {
+                    try
+                    {
+                        byte[] args = new byte[8];
+                        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+                        BitConverter.GetBytes((uint)status).CopyTo(args, 4);
+
+                        byte[] outBuf = CallMethod(DEVS, args);
+                        return BitConverter.ToInt32(outBuf, 0);
+                    }
+                    catch { }
+                }
+
+                if (isWmiAvailable)
+                {
+                    try
+                    {
+                        using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
+                        {
+                            foreach (ManagementObject obj in searcher.Get())
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("DEVS"))
+                                {
+                                    inParams["Device_ID"] = deviceId;
+                                    inParams["Control_status"] = (uint)status;
+                                    ManagementBaseObject outParams = obj.InvokeMethod("DEVS", inParams, null);
+                                    return Convert.ToInt32(outParams["result"]);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                return -1;
+            }
+        }
+
+        public static int DeviceSet(uint deviceId, byte[] parameters)
+        {
+            lock (acpiLock)
+            {
+                if (isAvailable && handle != new IntPtr(-1))
+                {
+                    try
+                    {
+                        byte[] args = new byte[4 + parameters.Length];
+                        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+                        parameters.CopyTo(args, 4);
+
+                        byte[] outBuf = CallMethod(DEVS, args);
+                        return BitConverter.ToInt32(outBuf, 0);
+                    }
+                    catch { }
+                }
+                return -1;
+            }
+        }
+
+        public static int DeviceGet(uint deviceId)
+        {
+            lock (acpiLock)
+            {
+                if (isAvailable && handle != new IntPtr(-1))
+                {
+                    try
+                    {
+                        byte[] args = new byte[8];
+                        BitConverter.GetBytes(deviceId).CopyTo(args, 0);
+                        byte[] outBuf = CallMethod(DSTS, args);
+
+                        return BitConverter.ToInt32(outBuf, 0) - 65536;
+                    }
+                    catch { }
+                }
+
+                if (isWmiAvailable)
+                {
+                    try
+                    {
+                        using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AsusAtkWmi_WMNB"))
+                        {
+                            foreach (ManagementObject obj in searcher.Get())
+                            {
+                                using (ManagementBaseObject inParams = obj.GetMethodParameters("DSTS"))
+                                {
+                                    inParams["Device_ID"] = deviceId;
+                                    ManagementBaseObject outParams = obj.InvokeMethod("DSTS", inParams, null);
+                                    return Convert.ToInt32(outParams["result"]) - 65536;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                return -1;
+            }
+        }
+
+        public static bool SetPerformanceMode(int mode)
+        {
+            // 0 = Balanced, 1 = Turbo, 2 = Silent
+            int res = DeviceSet(PerformanceMode, mode);
+            if (res != 1)
+            {
+                // Vivobook fallback: 0 = Standard, 2 = Performance, 1 = Whisper
+                int vivoMode = mode;
+                if (mode == 1) vivoMode = 2;
+                else if (mode == 2) vivoMode = 1;
+                res = DeviceSet(VivoBookMode, vivoMode);
+            }
+            return res == 1;
+        }
+
+        public static int GetFanRpm(uint endpoint)
+        {
+            int raw = DeviceGet(endpoint);
+            if (raw < 0) return 0;
+            int val = raw & 0xFFFF;
+            if (val <= 0 || val >= 10000) return 0;
+            if (val <= 120) return val * 100;
+            return val;
+        }
+
+        public static int GetCpuFanRpm()
+        {
+            return GetFanRpm(CPU_Fan);
+        }
+
+        public static int GetGpuFanRpm()
+        {
+            return GetFanRpm(GPU_Fan);
+        }
+
+        public static int GetCpuTemperature()
+        {
+            int temp = DeviceGet((uint)Temp_CPU);
+            if (temp >= 20 && temp <= 115) return temp;
+            return -1;
+        }
+
+        public static bool SetCustomDuty(int dutyPercentage)
+        {
+            dutyPercentage = Math.Max(30, Math.Min(100, dutyPercentage));
+
+            if (dutyPercentage >= 80)
+            {
+                SetPerformanceMode(1); // Turbo
+            }
+            else if (dutyPercentage <= 45)
+            {
+                SetPerformanceMode(2); // Silent
+            }
+            else
+            {
+                SetPerformanceMode(0); // Balanced
+            }
+
+            try
+            {
+                byte duty = (byte)dutyPercentage;
+                byte p1 = (byte)Math.Max(20, duty * 50 / 100);
+                byte p2 = (byte)Math.Max(25, duty * 70 / 100);
+                byte p3 = duty;
+                byte[] curve = new byte[16] {
+                    40, 50, 60, 70, 75, 80, 88, 95,
+                    p1, p1, p2, p3, p3, duty, 100, 100
+                };
+
+                DeviceSet(DevsCPUFanCurve, curve);
+                DeviceSet(DevsGPUFanCurve, curve);
+                return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        public static bool ResetFans()
+        {
+            return SetPerformanceMode(0);
+        }
+
+        public static void Close()
+        {
+            lock (acpiLock)
+            {
+                try
+                {
+                    ResetFans();
+                    if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                    {
+                        CloseHandle(handle);
+                        handle = new IntPtr(-1);
+                    }
+                    isAvailable = false;
+                    isWmiAvailable = false;
+                }
+                catch { }
+            }
+        }
+    }
+
     // ==========================================
     // HARDWARE BRIDGE: Native direct communication
     // ==========================================
@@ -37,6 +400,9 @@ namespace AspireSense
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetHandleByIndex_v2")]
         public static extern int nvmlDeviceGetHandleByIndex(uint index, out IntPtr device);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetName")]
+        public static extern int nvmlDeviceGetName(IntPtr device, StringBuilder name, uint length);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct nvmlUtilization_t
@@ -115,6 +481,10 @@ namespace AspireSense
         private static bool nvmlReady = false;
         private static IntPtr nvmlDevice = IntPtr.Zero;
 
+        // Hardware Identity & Detection
+        public static HardwareVendor DetectedVendor = HardwareVendor.AcerAspire;
+        public static bool IsAsusHardware = false;
+
         // Chassis & Firmware Profile
         public static string ChassisCpuName = "Intel Core 5 210H";
         public static string ChassisGpuName = "NVIDIA GeForce RTX 4050 Laptop GPU (6GB)";
@@ -122,6 +492,7 @@ namespace AspireSense
         public static string ChassisEcVersion = "v9.13";
         public static string ChassisModel = "Acer Aspire A715-79G";
         public static string ChassisOs = "Windows 11 (64-bit)";
+        public static double ChassisTotalRamGb = 16.0;
         public static int CachedBatteryDesignMwh = 52514;
         public static int CachedBatteryFullMwh = 53761;
 
@@ -134,12 +505,32 @@ namespace AspireSense
                 {
                     int hRes = nvmlDeviceGetHandleByIndex(0, out nvmlDevice);
                     nvmlReady = (hRes == 0 && nvmlDevice != IntPtr.Zero);
+                    if (nvmlReady)
+                    {
+                        StringBuilder sb = new StringBuilder(128);
+                        if (nvmlDeviceGetName(nvmlDevice, sb, 128) == 0 && sb.Length > 0)
+                        {
+                            ChassisGpuName = sb.ToString().Trim();
+                        }
+                    }
                 }
             }
             catch
             {
                 nvmlReady = false;
             }
+
+            // Read Total System Memory
+            try
+            {
+                MEMORYSTATUSEX mem = new MEMORYSTATUSEX();
+                mem.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+                if (GlobalMemoryStatusEx(ref mem))
+                {
+                    ChassisTotalRamGb = Math.Round(mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+                }
+            }
+            catch { }
 
             // Read CPU Profile from Registry
             try
@@ -156,18 +547,48 @@ namespace AspireSense
             catch { }
 
             // Read BIOS & Chassis Profile from Registry
+            string sysMfg = "";
+            string boardMfg = "";
+            string prodName = "";
             try
             {
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\BIOS"))
                 {
                     if (key != null)
                     {
+                        object sm = key.GetValue("SystemManufacturer");
+                        if (sm != null) sysMfg = sm.ToString().Trim();
+
+                        object bm = key.GetValue("BaseBoardManufacturer");
+                        if (bm != null) boardMfg = bm.ToString().Trim();
+
                         object m = key.GetValue("SystemProductName");
-                        if (m != null) ChassisModel = "Acer " + m.ToString().Trim();
+                        if (m != null) prodName = m.ToString().Trim();
+
+                        bool isAsus = sysMfg.IndexOf("ASUS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      boardMfg.IndexOf("ASUS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      prodName.IndexOf("TUF", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      prodName.IndexOf("ROG", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      prodName.IndexOf("ASUS", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        if (isAsus)
+                        {
+                            DetectedVendor = HardwareVendor.AsusTuf;
+                            ChassisModel = prodName.StartsWith("ASUS", StringComparison.OrdinalIgnoreCase) ? prodName : "ASUS " + prodName;
+                        }
+                        else
+                        {
+                            DetectedVendor = HardwareVendor.AcerAspire;
+                            ChassisModel = prodName.StartsWith("Acer", StringComparison.OrdinalIgnoreCase) ? prodName : "Acer " + prodName;
+                        }
 
                         object bv = key.GetValue("BIOSVersion");
                         object br = key.GetValue("BIOSReleaseDate");
-                        if (bv != null) ChassisBiosVersion = "Insyde v" + bv.ToString().Trim() + (br != null ? " (" + br.ToString().Trim() + ")" : "");
+                        if (bv != null)
+                        {
+                            string biosPrefix = (DetectedVendor == HardwareVendor.AsusTuf) ? "ASUS BIOS v" : "Insyde v";
+                            ChassisBiosVersion = biosPrefix + bv.ToString().Trim() + (br != null ? " (" + br.ToString().Trim() + ")" : "");
+                        }
 
                         object ecMaj = key.GetValue("ECFirmwareMajorRelease");
                         object ecMin = key.GetValue("ECFirmwareMinorRelease");
@@ -176,6 +597,26 @@ namespace AspireSense
                 }
             }
             catch { }
+
+            // Initialize ASUS ACPI engine if ASUS hardware detected, or verify via driver probe
+            if (DetectedVendor == HardwareVendor.AsusTuf)
+            {
+                if (AsusAcpiBridge.Initialize())
+                {
+                    IsAsusHardware = true;
+                }
+            }
+            else
+            {
+                // Secondary check: verify if ASUS ACPI driver exists on system
+                if (AsusAcpiBridge.Initialize())
+                {
+                    DetectedVendor = HardwareVendor.AsusTuf;
+                    IsAsusHardware = true;
+                    if (!ChassisModel.StartsWith("ASUS", StringComparison.OrdinalIgnoreCase))
+                        ChassisModel = "ASUS " + ChassisModel;
+                }
+            }
 
             // Read Windows OS Build from Registry
             try
@@ -199,8 +640,15 @@ namespace AspireSense
         {
             try
             {
-                // CRITICAL SAFETY: Always restore EC to factory automatic thermal curve on shutdown
-                ResetToAuto();
+                if (IsAsusHardware)
+                {
+                    AsusAcpiBridge.Close();
+                }
+                else
+                {
+                    // CRITICAL SAFETY: Always restore EC to factory automatic thermal curve on shutdown
+                    ResetToAuto();
+                }
             }
             catch { }
 
@@ -217,6 +665,11 @@ namespace AspireSense
 
         public static bool ResetToAuto()
         {
+            if (IsAsusHardware)
+            {
+                return AsusAcpiBridge.ResetFans();
+            }
+
             lock (ecLock)
             {
                 try
@@ -244,6 +697,15 @@ namespace AspireSense
 
         public static bool SetFanMode(int mode)
         {
+            if (IsAsusHardware)
+            {
+                if (mode == 0) return AsusAcpiBridge.SetPerformanceMode(0); // Balanced / Auto
+                if (mode == 1) return AsusAcpiBridge.SetPerformanceMode(1); // Turbo / Max
+                if (mode == 3) return AsusAcpiBridge.SetPerformanceMode(2); // Silent / Quiet
+                if (mode == 6) return AsusAcpiBridge.SetCustomDuty(80);
+                return true;
+            }
+
             lock (ecLock)
             {
                 try
@@ -276,6 +738,11 @@ namespace AspireSense
 
         public static bool SetCustomSpeed(int dutyPercentage)
         {
+            if (IsAsusHardware)
+            {
+                return AsusAcpiBridge.SetCustomDuty(dutyPercentage);
+            }
+
             lock (ecLock)
             {
                 try
@@ -454,51 +921,97 @@ namespace AspireSense
             }
         }
 
+        private static int GetThermalZoneTemperature()
+        {
+            try
+            {
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature"))
+                {
+                    foreach (ManagementObject obj in s.Get())
+                    {
+                        using (obj)
+                        {
+                            double kelvin10 = Convert.ToDouble(obj["CurrentTemperature"]);
+                            int celsius = (int)((kelvin10 / 10.0) - 273.15);
+                            if (celsius >= 20 && celsius <= 115) return celsius;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return -1;
+        }
+
         public static SensorData ReadSensors(PerformanceCounter cpuCounter)
         {
             SensorData data = new SensorData();
             data.GpuThrottleStatus = "OPTIMAL";
             data.VramTotalGb = 6.0;
 
-            lock (ecLock)
+            if (IsAsusHardware)
             {
-                try
+                int asusCpuRpm = AsusAcpiBridge.GetCpuFanRpm();
+                int asusGpuRpm = AsusAcpiBridge.GetGpuFanRpm();
+                int asusCpuTemp = AsusAcpiBridge.GetCpuTemperature();
+
+                data.CpuRpm = asusCpuRpm;
+                data.GpuRpm = asusGpuRpm;
+                data.CpuDuty = (asusCpuRpm > 0) ? Math.Min(100, Math.Max(20, (asusCpuRpm * 100) / 5400)) : 0;
+                data.GpuDuty = (asusGpuRpm > 0) ? Math.Min(100, Math.Max(20, (asusGpuRpm * 100) / 5400)) : 0;
+
+                if (asusCpuTemp >= 20 && asusCpuTemp <= 115)
                 {
-                    byte[] buf = new byte[256];
-                    int res = GetDCHU_Data_Buffer(12, buf);
-
-                    if (res == 12)
+                    data.CpuTemp = asusCpuTemp;
+                }
+                else
+                {
+                    int tzTemp = GetThermalZoneTemperature();
+                    data.CpuTemp = (tzTemp >= 20 && tzTemp <= 115) ? tzTemp : 45;
+                }
+                data.GpuTemp = 35; // Default before NVML reads it
+            }
+            else
+            {
+                lock (ecLock)
+                {
+                    try
                     {
-                        int rawCpuRpm = (buf[2] << 8) | buf[3];
-                        int rawGpuRpm = (buf[4] << 8) | buf[5];
+                        byte[] buf = new byte[256];
+                        int res = GetDCHU_Data_Buffer(12, buf);
 
-                        // Filter out disconnected sensor / glitch readings (0xFFFF or >= 9000 RPM)
-                        data.CpuRpm = (rawCpuRpm > 0 && rawCpuRpm < 9000) ? rawCpuRpm : 0;
-                        data.GpuRpm = (rawGpuRpm > 0 && rawGpuRpm < 9000) ? rawGpuRpm : 0;
+                        if (res == 12)
+                        {
+                            int rawCpuRpm = (buf[2] << 8) | buf[3];
+                            int rawGpuRpm = (buf[4] << 8) | buf[5];
 
-                        data.CpuDuty = Math.Min(100, (int)buf[16]);
-                        data.GpuDuty = Math.Min(100, (int)buf[19]);
+                            // Filter out disconnected sensor / glitch readings (0xFFFF or >= 9000 RPM)
+                            data.CpuRpm = (rawCpuRpm > 0 && rawCpuRpm < 9000) ? rawCpuRpm : 0;
+                            data.GpuRpm = (rawGpuRpm > 0 && rawGpuRpm < 9000) ? rawGpuRpm : 0;
 
-                        int rawCpuTemp = buf[18];
-                        int rawGpuTemp = buf[21];
+                            data.CpuDuty = Math.Min(100, (int)buf[16]);
+                            data.GpuDuty = Math.Min(100, (int)buf[19]);
 
-                        data.CpuTemp = (rawCpuTemp >= 20 && rawCpuTemp <= 115) ? rawCpuTemp : 45;
-                        data.GpuTemp = (rawGpuTemp >= 20 && rawGpuTemp <= 115) ? rawGpuTemp : 35;
+                            int rawCpuTemp = buf[18];
+                            int rawGpuTemp = buf[21];
+
+                            data.CpuTemp = (rawCpuTemp >= 20 && rawCpuTemp <= 115) ? rawCpuTemp : 45;
+                            data.GpuTemp = (rawGpuTemp >= 20 && rawGpuTemp <= 115) ? rawGpuTemp : 35;
+                        }
+                        else
+                        {
+                            data.CpuTemp = 45;
+                            data.GpuTemp = 35;
+                            data.CpuRpm = 1000;
+                            data.GpuRpm = 0;
+                        }
                     }
-                    else
+                    catch
                     {
                         data.CpuTemp = 45;
                         data.GpuTemp = 35;
                         data.CpuRpm = 1000;
                         data.GpuRpm = 0;
                     }
-                }
-                catch
-                {
-                    data.CpuTemp = 45;
-                    data.GpuTemp = 35;
-                    data.CpuRpm = 1000;
-                    data.GpuRpm = 0;
                 }
             }
 
@@ -1403,8 +1916,23 @@ namespace AspireSense
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(350) });
 
+            string cpuGaugeTitle = "INTEL CORE™ PROCESSOR";
+            if (!string.IsNullOrEmpty(HardwareBridge.ChassisCpuName))
+            {
+                if (HardwareBridge.ChassisCpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0)
+                    cpuGaugeTitle = "AMD RYZEN™ PROCESSOR";
+                else if (HardwareBridge.ChassisCpuName.IndexOf("Intel", StringComparison.OrdinalIgnoreCase) >= 0)
+                    cpuGaugeTitle = "INTEL CORE™ PROCESSOR";
+                else
+                    cpuGaugeTitle = HardwareBridge.ChassisCpuName.ToUpperInvariant();
+            }
+
+            string gpuGaugeTitle = !string.IsNullOrEmpty(HardwareBridge.ChassisGpuName)
+                ? HardwareBridge.ChassisGpuName.ToUpperInvariant()
+                : "NVIDIA GEFORCE GPU";
+
             Border cpuBox = CreateSpeedoCard();
-            cpuSpeedo = new SpeedometerGauge("INTEL CORE™ PROCESSOR", "CPU Workload & Thermal Sensor", 320);
+            cpuSpeedo = new SpeedometerGauge(cpuGaugeTitle, "CPU Workload & Thermal Sensor", 320);
             cpuBox.Child = cpuSpeedo;
             Grid.SetColumn(cpuBox, 0);
             g.Children.Add(cpuBox);
@@ -1414,7 +1942,7 @@ namespace AspireSense
             g.Children.Add(centerBox);
 
             Border gpuBox = CreateSpeedoCard();
-            gpuSpeedo = new SpeedometerGauge("NVIDIA GEFORCE RTX 4050", "Hardware Sensor via NVML", 320);
+            gpuSpeedo = new SpeedometerGauge(gpuGaugeTitle, "Hardware Sensor via NVML", 320);
             gpuBox.Child = gpuSpeedo;
             Grid.SetColumn(gpuBox, 2);
             g.Children.Add(gpuBox);
@@ -1846,7 +2374,8 @@ namespace AspireSense
             topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             // CPU Dedicated Blower Card
-            Border cpuCard = CreateSectionCard("CPU DEDICATED COOLING BLOWER", "Intel Core™ 5 210H Thermal Extraction");
+            string cpuCoolingSub = (!string.IsNullOrEmpty(HardwareBridge.ChassisCpuName) ? HardwareBridge.ChassisCpuName : "CPU Package") + " Thermal Extraction";
+            Border cpuCard = CreateSectionCard("CPU DEDICATED COOLING BLOWER", cpuCoolingSub);
             StackPanel cpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
             lblCoolingCpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255)) };
             meterCoolingCpu = new SegmentedMeter(20, Color.FromRgb(0, 229, 255), 12, 6);
@@ -1860,7 +2389,8 @@ namespace AspireSense
             topRow.Children.Add(cpuCard);
 
             // GPU Dedicated Blower Card
-            Border gpuCard = CreateSectionCard("GPU DEDICATED COOLING BLOWER", "NVIDIA GeForce RTX 4050 Thermal Extraction");
+            string gpuCoolingSub = (!string.IsNullOrEmpty(HardwareBridge.ChassisGpuName) ? HardwareBridge.ChassisGpuName : "GPU Silicon") + " Thermal Extraction";
+            Border gpuCard = CreateSectionCard("GPU DEDICATED COOLING BLOWER", gpuCoolingSub);
             gpuCard.Margin = new Thickness(14, 0, 0, 0);
             StackPanel gpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
             lblCoolingGpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248)) };
@@ -1952,7 +2482,10 @@ namespace AspireSense
             g.Children.Add(flushCard);
 
             // Bottom: Fan Curve Architecture & Fine Override
-            Border bottomCard = CreateSectionCard("HARDWARE FAN CURVE ARCHITECTURE", "Insyde Embedded Controller Dynamic 4-Stage Curve");
+            string curveSub = (HardwareBridge.DetectedVendor == HardwareVendor.AsusTuf)
+                ? "ASUS TUF / ROG ACPI Firmware Dynamic Thermal Curve"
+                : "Insyde Embedded Controller Dynamic 4-Stage Curve";
+            Border bottomCard = CreateSectionCard("HARDWARE FAN CURVE ARCHITECTURE", curveSub);
             bottomCard.Margin = new Thickness(0, 10, 0, 0);
 
             StackPanel botSp = new StackPanel { Margin = new Thickness(18, 12, 18, 12) };
@@ -2418,7 +2951,8 @@ namespace AspireSense
             TextBlock dummy;
             ug.Children.Add(CreateRibbonTile("PROCESSOR MATRIX", HardwareBridge.ChassisCpuName, string.Format("{0} Cores • 4.8 GHz Max", Environment.ProcessorCount), out dummy));
             ug.Children.Add(CreateRibbonTile("GRAPHICS SILICON", HardwareBridge.ChassisGpuName, "PCIe Gen 4.0 x8 Bus", out dummy));
-            ug.Children.Add(CreateRibbonTile("MEMORY ARCHITECTURE", "32 GB Dual-Channel", "DDR5 SODIMM @ 3200 MT/s", out dummy));
+            string ramDesc = string.Format("{0:F0} GB Dual-Channel", HardwareBridge.ChassisTotalRamGb > 0 ? HardwareBridge.ChassisTotalRamGb : 16.0);
+            ug.Children.Add(CreateRibbonTile("MEMORY ARCHITECTURE", ramDesc, "High-Speed Memory Bus", out dummy));
             ug.Children.Add(CreateRibbonTile("FIRMWARE PLATFORM", HardwareBridge.ChassisBiosVersion, "EC Controller " + HardwareBridge.ChassisEcVersion, out dummy));
             ug.Children.Add(CreateRibbonTile("SYSTEM RUNTIME", "0d 00h 00m 00s", HardwareBridge.ChassisOs, out lblHealthUptime));
 
@@ -2808,9 +3342,13 @@ namespace AspireSense
             f.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             f.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(350) });
 
+            string archInfo = (HardwareBridge.DetectedVendor == HardwareVendor.AsusTuf)
+                ? string.Format("AspireSense 2026 | {0} | ASUS Direct ACPI Hardware Engine Active", HardwareBridge.ChassisModel)
+                : string.Format("AspireSense 2026 | {0} | Standalone EC Hardware Architecture", HardwareBridge.ChassisModel);
+
             TextBlock info = new TextBlock
             {
-                Text = "AspireSense 2026 | Acer Aspire A715-79G (RTX 4050) | Standalone EC Hardware Architecture",
+                Text = archInfo,
                 FontSize = 9.5,
                 Foreground = new SolidColorBrush(Color.FromRgb(100, 130, 170)),
                 VerticalAlignment = VerticalAlignment.Center,
@@ -2819,9 +3357,13 @@ namespace AspireSense
             Grid.SetColumn(info, 0);
             f.Children.Add(info);
 
+            string statusInfo = (HardwareBridge.DetectedVendor == HardwareVendor.AsusTuf)
+                ? "Status: ASUS Direct ACPI (Independent of Armoury Crate)"
+                : "Status: Fully Standalone (Independent of CC3)";
+
             TextBlock stat = new TextBlock
             {
-                Text = "Status: Fully Standalone (Independent of CC3)",
+                Text = statusInfo,
                 FontSize = 9.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = new SolidColorBrush(Color.FromRgb(0, 200, 140)),
