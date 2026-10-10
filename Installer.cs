@@ -44,7 +44,7 @@ namespace AspireSenseInstaller
         public SetupWindow(bool uninstallMode)
         {
             this.isUninstallMode = uninstallMode;
-            this.Title = isUninstallMode ? "AspireSense Uninstaller" : "AspireSense Setup v1.0.0";
+            this.Title = isUninstallMode ? "AspireSense Uninstaller" : "AspireSense Setup v1.1.0";
             this.Width = 680;
             this.Height = 490;
             this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
@@ -161,7 +161,7 @@ namespace AspireSenseInstaller
 
             TextBlock txtTitle = new TextBlock
             {
-                Text = isUninstallMode ? "ASPIRESENSE UNINSTALL WIZARD" : "ASPIRESENSE SETUP WIZARD v1.0.0",
+                Text = isUninstallMode ? "ASPIRESENSE UNINSTALL WIZARD" : "ASPIRESENSE SETUP WIZARD v1.1.0",
                 FontSize = 13,
                 FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
@@ -861,7 +861,7 @@ namespace AspireSenseInstaller
                     if (key != null)
                     {
                         key.SetValue("DisplayName", "AspireSense");
-                        key.SetValue("DisplayVersion", "1.0.0");
+                        key.SetValue("DisplayVersion", "1.1.0");
                         key.SetValue("Publisher", "netfreakkk");
                         key.SetValue("DisplayIcon", iconPath);
                         key.SetValue("InstallLocation", installDir);

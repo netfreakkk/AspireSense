@@ -4,7 +4,7 @@
 
 # AspireSense (Open-Source Edition)
 
-A standalone, high-performance hardware monitor and cooling control center tailored for **Acer Aspire 7 (RTX 4050 / A715-79G)** and compatible gaming laptops.
+A standalone, high-performance hardware monitor and cooling control cockpit for **Acer, ASUS, Lenovo, HP, Dell**, and compatible gaming laptops. Completely independent of bloated OEM companion software.
 
 ---
 

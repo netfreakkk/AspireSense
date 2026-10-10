@@ -1,43 +1,39 @@
-# AspireSense v1.0.0 - Supercar Cockpit Edition
+# AspireSense v1.1.0 - Multi-Vendor Cockpit Release
 
-**AspireSense** is an open-source, ultra-low-latency fan control center, thermal monitor, and gaming telemetry suite engineered specifically for Acer Aspire laptops (*Acer Aspire 7 A715-79G with Intel Core 5 210H & NVIDIA GeForce RTX 4050 Laptop GPU*).
+**AspireSense v1.1.0** expands from an Acer-exclusive utility into an open-source, multi-vendor fan control and hardware telemetry cockpit engineered for **Acer, ASUS, Lenovo, HP, and Dell** gaming laptops.
 
-Operates directly over the Insyde / Clevo Embedded Controller (EC) and NVIDIA NVML, completely independent of Acer Care Center / Care Center 3.
+Operates directly over native kernel ACPI drivers, vendor WMI interfaces, and NVIDIA NVML—completely independent of proprietary OEM software (Armoury Crate, Lenovo Vantage, OMEN Gaming Hub, Alienware Command Center, Acer Care Center).
 
 ---
 
-### Key Features
+### What's New in v1.1.0
 
-* **Cockpit Speedometer Dashboard:**
-  * Dual 270-degree tachometer sweep gauges (7 o'clock to 5 o'clock) with numbered ticks (`0` to `100`).
-  * Neon crimson Redline Zone (80% to 100%) with active needle response.
-  * Embedded coolant sub-gauges with 5-segment LED thermal meters.
-  * Sports Car Drive-Mode Selector:
-    * `[ ECO ]` (Silent - 28% Duty)
-    * `[ DYNAMIC ]` (Balanced Daily - Adaptive Auto)
-    * `[ SPORT+ ]` (100% Maximum Turbo Airflow)
-  * Manual automotive fan throttle slider with quick duty lock.
+#### 1. Universal Multi-Vendor Hardware Support
+* **ASUS TUF Gaming & ROG Laptops:** Native direct communication via `\\.\ATKACPI` (`IOCTL 0x0022240C`) and `AsusAtkWmi_WMNB`. Live CPU/GPU fan RPM reading and dynamic mode switching.
+* **Lenovo Legion, LOQ & IdeaPad Gaming:** Native WMI control over `root\wmi:LNVPC_WMI` (`SetSmartFanMode`) and `Lenovo_Vantage_EC` (`SetPerformanceMode`).
+* **HP OMEN, Victus & Pavilion Gaming:** Direct BIOS control via `root\wmi:hpqBIntM` (`BiosControl`) and `HP_BiosSetting`.
+* **Dell Alienware & G-Series (G15/G16):** Direct thermal profiles over `root\wmi:Dell_ThermalInformation` (`SetThermalProfile`) and `Alienware_Platform`.
+* **Acer Aspire, Nitro & Predator:** Insyde H2O Embedded Controller buffer protocol with isolated `InsydeDCHU.dll`.
 
-* **Cooling Control Studio:**
-  * Dual dedicated blowers with 20-segment cyan/azure LED meters.
-  * **60-Second Turbo Heat Flush:** 1-click vapor chamber purge with active countdown timer.
-  * Interactive 4-Stage Hardware Curve Visualizer with real-time active stage illumination.
+#### 2. Adaptive Hardware Installer
+* **Chassis Architecture Detection:** Automatically detects target laptop motherboard and manufacturer from BIOS.
+* **Selective DLL Payload Extraction:** `InsydeDCHU.dll` is unpacked **only** on Acer machines. On ASUS, Lenovo, HP, Dell, and generic systems, it is omitted entirely to keep installations minimal and clean.
+* **Active Process Handling:** Automatically detects and closes running instances before extracting updates to avoid locked-file errors.
 
-* **Gaming Hub:**
-  * **1-Click Ultra Game Boost:** Max Turbo cooling + RAM working set purge + Windows-Key lock + High Performance power plan.
-  * **Live Multiplayer CDN Ping Telemetry:** Cloudflare edge ping with latency quality ratings.
-  * Hardware acceleration quick launchers (NVIDIA Control Panel, Task Manager, DxDiag, HAGS Graphics).
+#### 3. Cockpit Dashboard Aesthetic with Clean Naming
+* **Radial Instrument Cluster:** Dual 270-degree tachometer gauges with 4-stage RPM arcs, dynamic needle physics, and neon crimson Redline zone.
+* **Clean Profile Trio:**
+  * **`AUTO`** — Balanced dynamic adaptive mode.
+  * **`QUIET`** — Silent acoustic low-RPM profile.
+  * **`MAX`** — 100% turbo boost maximum cooling.
+* **Manual Fan Override:** Precision percentage slider with active duty locking.
+* **Dynamic Hardware Footer:** Real-time indicator displaying the detected vendor architecture and active engine.
 
-* **Minimalist System Health & Analytics:**
-  * Silicon Chassis Ribbon with live uptime telemetry.
-  * RTX 4050 AD107M core & memory clock meters, PCIe bus link, and throttle reason diagnostics.
-  * RAM load meter with top 3 consuming processes and 1-click RAM purger.
-  * Battery health & wear index calculation (mWh design vs full charge).
-  * 1-click Markdown diagnostic report export to clipboard.
-
-* **Hardware Safety & Thermal Watchdog:**
-  * Auto-failsafe watchdog engages Turbo cooling if temperatures exceed 90 C under constrained modes.
-  * Fail-safe restoration: Automatically restores EC fan controller to BIOS Auto on app close.
+#### 4. Stability, Safety & Security Hardening
+* **Embedded UAC Administrator Manifest:** Guarantees proper elevation for Windows kernel ACPI device driver access on first launch.
+* **WMI Resource Protection:** Eliminates COM handle leaks across all hardware bridges and thermal zone polling routines.
+* **Thermal Watchdog:** Automatically engages maximum cooling if hardware exceeds thermal thresholds under constrained modes.
+* **Exit Auto-Reset:** Guarantees fan controllers return to BIOS Auto control on application close or termination.
 
 ---
 
@@ -45,13 +41,13 @@ Operates directly over the Insyde / Clevo Embedded Controller (EC) and NVIDIA NV
 
 | Asset | Description | Size | SHA256 Checksum |
 | :--- | :--- | :--- | :--- |
-| **`AspireSense-Setup.exe`** | Standalone Windows Installer (with Desktop & Start Menu shortcuts) | ~3.7 MB | `7486E81827000167A5C9FE7729E024E68522E5896712E3B6873146644D8086AB` |
-| **`AspireSense-Portable-v1.0.0.zip`** | Portable release package (extract and run) | ~2.0 MB | `A0C90F5AC65B8C1B7E5C1BBC7B35D5B7E59B03381380F658B21A71FDD4F2E2C2` |
-| **`AspireSense.exe`** | Standalone Executable | ~177 KB | `322C10A247BFE9C966E2FC74E3D93071B3C8B2B87A35EF7FF5C2944D4BAC6340` |
+| **`AspireSense-Setup.exe`** | Standalone Adaptive Installer (Desktop & Start Menu shortcuts) | ~3.7 MB | `81FB79F64C13C208F91719A1A7F32F9D09DE4909019441657329F443A9436349` |
+| **`AspireSense-Portable-v1.1.0.zip`** | Portable release package (extract and run) | ~2.0 MB | `34A44463230693B29823438CC58C4EDD4BE621170EB4622A4FB00E73C15F53EB` |
+| **`AspireSense.exe`** | Standalone Executable | ~177 KB | `97D2C374F9CC0F6929DA7E29AE75DF5CB74F424335BCF94EC9459B7A23525C56` |
 
 ---
 
 ### Requirements
 * Windows 10 / 11 (64-bit)
 * .NET Framework 4.8+ (pre-installed on Windows 10/11)
-* Run as Administrator (required for direct EC hardware register access)
+* Run as Administrator (requested automatically via embedded UAC manifest)

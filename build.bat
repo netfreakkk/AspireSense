@@ -28,13 +28,13 @@ echo [OK] AspireSense-Setup.exe generated.
 echo.
 
 echo [3/3] Generating Portable Release Zip...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { Add-Type -AssemblyName System.IO.Compression.FileSystem; $stage = Join-Path '%~dp0' 'AspireSense-v1.0.0'; if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }; New-Item -ItemType Directory -Path $stage | Out-Null; Copy-Item '%~dp0AspireSense.exe' $stage; Copy-Item '%~dp0InsydeDCHU.dll' $stage; Copy-Item '%~dp0logo.png' $stage; Copy-Item '%~dp0app.ico' $stage; Copy-Item '%~dp0README.md' $stage; Copy-Item '%~dp0LICENSE' $stage; $zip = Join-Path '%~dp0' 'AspireSense-Portable-v1.0.0.zip'; if (Test-Path $zip) { Remove-Item $zip -Force }; [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip); Remove-Item $stage -Recurse -Force; Write-Host '[OK] Portable zip created.' }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { Add-Type -AssemblyName System.IO.Compression.FileSystem; $stage = Join-Path '%~dp0' 'AspireSense-v1.1.0'; if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }; New-Item -ItemType Directory -Path $stage | Out-Null; Copy-Item '%~dp0AspireSense.exe' $stage; Copy-Item '%~dp0InsydeDCHU.dll' $stage; Copy-Item '%~dp0logo.png' $stage; Copy-Item '%~dp0app.ico' $stage; Copy-Item '%~dp0README.md' $stage; Copy-Item '%~dp0LICENSE' $stage; $zip = Join-Path '%~dp0' 'AspireSense-Portable-v1.1.0.zip'; if (Test-Path $zip) { Remove-Item $zip -Force }; [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip); Remove-Item $stage -Recurse -Force; Write-Host '[OK] Portable zip created.' }"
 echo.
 
 echo ========================================================
 echo  BUILD COMPLETE! Release Artifacts:
 echo   - Installer: AspireSense-Setup.exe
-echo   - Portable:  AspireSense-Portable-v1.0.0.zip
+echo   - Portable:  AspireSense-Portable-v1.1.0.zip
 echo   - App:       AspireSense.exe
 echo ========================================================
 echo.
