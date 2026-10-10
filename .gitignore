@@ -6,3 +6,8 @@
 .vs/
 bin/
 obj/
+
+# Release binary archives (uploaded to GitHub Releases)
+*.zip
+*-Setup.exe
+

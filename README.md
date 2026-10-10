@@ -68,7 +68,20 @@ A standalone, high-performance hardware monitor and cooling control center tailo
 
 ---
 
-## How to Launch
-Double-click:
-`AspireSense.exe`
-*(Keep `InsydeDCHU.dll` in the same directory).*
+## 🚀 Installation & Downloads
+
+### Option 1: Standalone Windows Installer (Recommended)
+Download **`AspireSense-Setup.exe`** from the [GitHub Releases](https://github.com/netfreakkk/AspireSense/releases) page:
+- **1-Click Self-Contained Setup**: Includes all native EC drivers and dependencies embedded.
+- **Shortcuts**: Automatically creates Desktop and Start Menu shortcuts with high-res icon.
+- **Windows Integration**: Fully registered in Windows Settings > Apps & Features with clean 1-click uninstaller.
+
+### Option 2: Portable Edition (No Install Required)
+Download **`AspireSense-Portable-v1.0.0.zip`**:
+- Extract anywhere and run **`AspireSense.exe`**.
+- Keep `InsydeDCHU.dll` in the same directory.
+
+---
+
+## 🛠️ Building from Source
+Run `build.bat` in the root folder to compile the application, standalone installer, and release zip in one click using .NET Framework 4.0+.
