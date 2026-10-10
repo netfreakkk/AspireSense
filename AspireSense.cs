@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Controls;
@@ -617,6 +618,9 @@ namespace AspireSense
     // ==========================================
     // SPEEDOMETER GAUGE COMPONENT (BLUE-BLACK DESIGN)
     // ==========================================
+    // ==========================================
+    // CYBERPUNK SUPERCAR COCKPIT SPEEDOMETER GAUGE
+    // ==========================================
     public class SpeedometerGauge : Canvas
     {
         private Path bgArc;
@@ -627,49 +631,57 @@ namespace AspireSense
         private TextBlock txtRpm;
         private TextBlock txtHeader;
         private TextBlock txtSub;
+        private SegmentedMeter miniTempBar;
 
         private double radius;
         private double cx;
         private double cy;
-        private double startAngle = 135.0;
-        private double sweepAngle = 270.0;
+        private double startAngle = 225.0; // 7 o'clock (bottom-left)
+        private double sweepAngle = 270.0; // Sweeps clockwise through 12 o'clock to 5 o'clock (bottom-right)
+        private LinearGradientBrush blueGrad;
 
         public SpeedometerGauge(string hardwareName, string modelSub, double size)
         {
             this.Width = size;
             this.Height = size + 35;
             this.cx = size / 2.0;
-            this.cy = (size / 2.0) - 5;
+            this.cy = (size / 2.0) - 8;
             this.radius = (size / 2.0) - 26;
 
+            // 1. Outer Halo Ring with Dash Pattern
             Ellipse outerRing = new Ellipse
             {
-                Width = size - 10,
-                Height = size - 10,
-                Stroke = new SolidColorBrush(Color.FromArgb(40, 0, 180, 255)),
+                Width = size - 12,
+                Height = size - 12,
+                Stroke = new SolidColorBrush(Color.FromArgb(40, 0, 210, 255)),
                 StrokeThickness = 1,
                 StrokeDashArray = new DoubleCollection(new double[] { 3, 3 })
             };
-            Canvas.SetLeft(outerRing, 5);
-            Canvas.SetTop(outerRing, 5);
+            Canvas.SetLeft(outerRing, 6);
+            Canvas.SetTop(outerRing, 6);
             this.Children.Add(outerRing);
 
+            // 2. Background Track Arc (Dark stealth slate)
             bgArc = new Path
             {
-                Stroke = new SolidColorBrush(Color.FromArgb(200, 15, 23, 42)),
-                StrokeThickness = 14,
+                Stroke = new SolidColorBrush(Color.FromArgb(220, 15, 23, 38)),
+                StrokeThickness = 12,
                 StrokeStartLineCap = PenLineCap.Round,
                 StrokeEndLineCap = PenLineCap.Round,
                 Data = CreateArcGeometry(cx, cy, radius, startAngle, startAngle + sweepAngle)
             };
             this.Children.Add(bgArc);
 
+            // 3. Numbered Radial Speed Ticks & REDLINE Zone (80% - 100%)
             for (int i = 0; i <= 10; i++)
             {
                 double angle = startAngle + (i / 10.0) * sweepAngle;
                 double rad = (angle - 90) * Math.PI / 180.0;
-                double rIn = radius - 14;
-                double rOut = (i % 5 == 0) ? (radius + 12) : (radius + 6);
+                bool isMajor = (i % 2 == 0);
+                bool isRedline = (i >= 8); // 80%, 90%, 100% are Redline!
+
+                double rIn = radius - (isMajor ? 14 : 9);
+                double rOut = radius + (isMajor ? 10 : 5);
 
                 Line tick = new Line
                 {
@@ -677,25 +689,56 @@ namespace AspireSense
                     Y1 = cy + rIn * Math.Sin(rad),
                     X2 = cx + rOut * Math.Cos(rad),
                     Y2 = cy + rOut * Math.Sin(rad),
-                    Stroke = (i % 5 == 0) ? new SolidColorBrush(Color.FromRgb(0, 210, 255)) : new SolidColorBrush(Color.FromArgb(120, 0, 150, 255)),
-                    StrokeThickness = (i % 5 == 0) ? 2.5 : 1.2
+                    Stroke = isRedline ? new SolidColorBrush(Color.FromRgb(255, 30, 86)) : (isMajor ? new SolidColorBrush(Color.FromRgb(0, 225, 255)) : new SolidColorBrush(Color.FromArgb(100, 0, 150, 255))),
+                    StrokeThickness = isRedline ? 2.5 : (isMajor ? 2.0 : 1.0)
                 };
                 this.Children.Add(tick);
+
+                if (isMajor)
+                {
+                    double rNum = radius - 26;
+                    double nx = cx + rNum * Math.Cos(rad) - 8;
+                    double ny = cy + rNum * Math.Sin(rad) - 6;
+
+                    TextBlock numTb = new TextBlock
+                    {
+                        Text = (i * 10).ToString(),
+                        FontSize = 8.5,
+                        FontWeight = FontWeights.Bold,
+                        Foreground = isRedline ? new SolidColorBrush(Color.FromRgb(255, 60, 90)) : new SolidColorBrush(Color.FromRgb(130, 170, 215))
+                    };
+                    Canvas.SetLeft(numTb, nx);
+                    Canvas.SetTop(numTb, ny);
+                    this.Children.Add(numTb);
+                }
             }
 
-            LinearGradientBrush blueGrad = new LinearGradientBrush
+            // Redline Badge near 95% mark
+            TextBlock redlineBadge = new TextBlock
+            {
+                Text = "REDLINE",
+                FontSize = 7,
+                FontWeight = FontWeights.Black,
+                Foreground = new SolidColorBrush(Color.FromRgb(255, 40, 80))
+            };
+            Canvas.SetLeft(redlineBadge, cx + 55);
+            Canvas.SetTop(redlineBadge, cy + 50);
+            this.Children.Add(redlineBadge);
+
+            // 4. Foreground Active Value Arc
+            blueGrad = new LinearGradientBrush
             {
                 StartPoint = new Point(0, 1),
                 EndPoint = new Point(1, 0)
             };
-            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 120, 255), 0.0));
-            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 210, 255), 0.7));
+            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 140, 255), 0.0));
+            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 225, 255), 0.7));
             blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(56, 189, 248), 1.0));
 
             valArc = new Path
             {
                 Stroke = blueGrad,
-                StrokeThickness = 14,
+                StrokeThickness = 12,
                 StrokeStartLineCap = PenLineCap.Round,
                 StrokeEndLineCap = PenLineCap.Round,
                 Effect = new DropShadowEffect
@@ -708,115 +751,129 @@ namespace AspireSense
             };
             this.Children.Add(valArc);
 
+            // 5. Laser Needle
             needle = new Line
             {
                 X1 = cx,
                 Y1 = cy,
-                X2 = cx,
-                Y2 = cy - (radius - 12),
-                Stroke = new LinearGradientBrush(Color.FromRgb(255, 255, 255), Color.FromRgb(0, 210, 255), 90),
-                StrokeThickness = 3,
+                X2 = cx - (radius - 14) * 0.707,
+                Y2 = cy + (radius - 14) * 0.707,
+                Stroke = new LinearGradientBrush(Color.FromRgb(255, 255, 255), Color.FromRgb(0, 225, 255), 90),
+                StrokeThickness = 3.2,
                 StrokeEndLineCap = PenLineCap.Round,
                 Effect = new DropShadowEffect
                 {
                     Color = Color.FromRgb(0, 210, 255),
-                    BlurRadius = 10,
+                    BlurRadius = 12,
                     ShadowDepth = 0,
-                    Opacity = 0.9
+                    Opacity = 0.95
                 }
             };
             this.Children.Add(needle);
 
+            // 6. Center Turbine Pivot Hub
             Ellipse pivot = new Ellipse
             {
-                Width = 18,
-                Height = 18,
-                Fill = new RadialGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(10, 20, 40)),
-                Stroke = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                Width = 20,
+                Height = 20,
+                Fill = new RadialGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(10, 18, 35)),
+                Stroke = new SolidColorBrush(Color.FromRgb(0, 225, 255)),
                 StrokeThickness = 2
             };
-            Canvas.SetLeft(pivot, cx - 9);
-            Canvas.SetTop(pivot, cy - 9);
+            Canvas.SetLeft(pivot, cx - 10);
+            Canvas.SetTop(pivot, cy - 10);
             this.Children.Add(pivot);
 
+            // 7. Center Digital Speedometer Readout
             txtPercent = new TextBlock
             {
                 Text = "0%",
-                FontSize = 38,
+                FontSize = 36,
                 FontWeight = FontWeights.Black,
                 Foreground = Brushes.White,
                 TextAlignment = TextAlignment.Center,
                 Width = size
             };
-            Canvas.SetTop(txtPercent, cy - 65);
+            Canvas.SetTop(txtPercent, cy - 62);
             this.Children.Add(txtPercent);
 
             TextBlock lblUsageSub = new TextBlock
             {
-                Text = "UTILIZATION",
-                FontSize = 9.5,
+                Text = "LOAD / DUTY",
+                FontSize = 8.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(100, 160, 220)),
+                Foreground = new SolidColorBrush(Color.FromRgb(90, 140, 190)),
                 TextAlignment = TextAlignment.Center,
                 Width = size
             };
-            Canvas.SetTop(lblUsageSub, cy - 25);
+            Canvas.SetTop(lblUsageSub, cy - 24);
             this.Children.Add(lblUsageSub);
 
+            // 8. Coolant Temperature Sub-Gauge in the Bottom Opening
             Border tempBadge = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(180, 10, 18, 35)),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(0, 180, 240)),
+                Background = new SolidColorBrush(Color.FromArgb(190, 11, 17, 30)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 0, 180, 240)),
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(14),
-                Padding = new Thickness(12, 4, 12, 4),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(10, 4, 10, 4),
                 HorizontalAlignment = HorizontalAlignment.Center
             };
+            StackPanel tSp = new StackPanel();
             txtTemp = new TextBlock
             {
                 Text = "🌡️ -- °C",
-                FontSize = 13,
+                FontSize = 11.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255))
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255)),
+                HorizontalAlignment = HorizontalAlignment.Center
             };
-            tempBadge.Child = txtTemp;
-            Canvas.SetLeft(tempBadge, cx - 45);
-            Canvas.SetTop(tempBadge, cy + 22);
+            tSp.Children.Add(txtTemp);
+
+            miniTempBar = new SegmentedMeter(5, Color.FromRgb(0, 255, 140), 10, 3);
+            miniTempBar.Margin = new Thickness(0, 3, 0, 0);
+            miniTempBar.HorizontalAlignment = HorizontalAlignment.Center;
+            tSp.Children.Add(miniTempBar);
+
+            tempBadge.Child = tSp;
+            Canvas.SetLeft(tempBadge, cx - 42);
+            Canvas.SetTop(tempBadge, cy + 20);
             this.Children.Add(tempBadge);
 
+            // 9. Lower Fan RPM & Titles
             txtRpm = new TextBlock
             {
                 Text = "❄️ -- RPM (0%)",
-                FontSize = 11.5,
+                FontSize = 11,
                 FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(Color.FromRgb(140, 200, 255)),
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
                 TextAlignment = TextAlignment.Center,
                 Width = size
             };
-            Canvas.SetTop(txtRpm, cy + 56);
+            Canvas.SetTop(txtRpm, cy + 62);
             this.Children.Add(txtRpm);
 
             txtHeader = new TextBlock
             {
                 Text = hardwareName,
-                FontSize = 12.5,
-                FontWeight = FontWeights.Bold,
+                FontSize = 12,
+                FontWeight = FontWeights.Black,
                 Foreground = Brushes.White,
                 TextAlignment = TextAlignment.Center,
                 Width = size
             };
-            Canvas.SetTop(txtHeader, size + 2);
+            Canvas.SetTop(txtHeader, size + 4);
             this.Children.Add(txtHeader);
 
             txtSub = new TextBlock
             {
                 Text = modelSub,
-                FontSize = 10,
-                Foreground = new SolidColorBrush(Color.FromRgb(120, 150, 180)),
+                FontSize = 9.5,
+                Foreground = new SolidColorBrush(Color.FromRgb(110, 150, 190)),
                 TextAlignment = TextAlignment.Center,
                 Width = size
             };
-            Canvas.SetTop(txtSub, size + 18);
+            Canvas.SetTop(txtSub, size + 20);
             this.Children.Add(txtSub);
 
             Update(0, 40, 0, 0);
@@ -826,7 +883,7 @@ namespace AspireSense
         {
             txtPercent.Text = string.Format("{0:F0}%", usage);
             txtTemp.Text = string.Format("🌡️ {0} °C", temp);
-            txtRpm.Text = string.Format("❄️ {0} RPM ({1}%)", rpm, duty);
+            txtRpm.Text = (rpm > 0) ? string.Format("❄️ {0} RPM ({1}%)", rpm, duty) : "❄️ 0 RPM (PASSIVE IDLE)";
 
             if (temp >= 85)
             {
@@ -841,9 +898,34 @@ namespace AspireSense
                 txtTemp.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255));
             }
 
+            if (miniTempBar != null)
+            {
+                double tPct = Math.Max(0.0, Math.Min(100.0, ((temp - 35) / 60.0) * 100.0));
+                miniTempBar.SetValue(tPct);
+                if (temp >= 85) miniTempBar.SetColor(Color.FromRgb(255, 40, 80));
+                else if (temp >= 72) miniTempBar.SetColor(Color.FromRgb(255, 170, 0));
+                else miniTempBar.SetColor(Color.FromRgb(0, 255, 140));
+            }
+
             double ratio = Math.Max(0.005, Math.Min(1.0, usage / 100.0));
             double targetAngle = startAngle + (sweepAngle * ratio);
             valArc.Data = CreateArcGeometry(cx, cy, radius, startAngle, targetAngle);
+
+            if (usage >= 85)
+            {
+                valArc.Stroke = new SolidColorBrush(Color.FromRgb(255, 30, 86));
+                needle.Stroke = new SolidColorBrush(Color.FromRgb(255, 50, 90));
+            }
+            else if (usage >= 70)
+            {
+                valArc.Stroke = new SolidColorBrush(Color.FromRgb(255, 170, 0));
+                needle.Stroke = new SolidColorBrush(Color.FromRgb(255, 200, 50));
+            }
+            else
+            {
+                valArc.Stroke = blueGrad;
+                needle.Stroke = new LinearGradientBrush(Color.FromRgb(255, 255, 255), Color.FromRgb(0, 225, 255), 90);
+            }
 
             double needleRad = (targetAngle - 90) * Math.PI / 180.0;
             needle.X2 = cx + (radius - 12) * Math.Cos(needleRad);
@@ -936,14 +1018,21 @@ namespace AspireSense
 
         // Cooling View Specific Controls
         private TextBlock lblCoolingCpuRpm;
-        private ProgressBar progCoolingCpu;
+        private SegmentedMeter meterCoolingCpu;
         private TextBlock lblCoolingGpuRpm;
-        private ProgressBar progCoolingGpu;
+        private SegmentedMeter meterCoolingGpu;
         private Slider sliderDedicatedCustom;
         private TextBlock lblDedicatedCustomVal;
+        private Border btnHeatFlush;
+        private TextBlock lblHeatFlushText;
+        private int heatFlushRemaining = 0;
+        private List<Border> curveCards = new List<Border>();
 
         // Gaming Hub Controls
         private TextBlock lblScenarioStatus;
+        private TextBlock lblGamePing;
+        private int pingTick = 0;
+        private int lastPingMs = 24;
 
         // Health Controls (Minimalist & Advanced Telemetry)
         private TextBlock lblHealthUptime;
@@ -1373,16 +1462,35 @@ namespace AspireSense
         {
             Border card = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(180, 10, 15, 28)),
-                CornerRadius = new CornerRadius(12),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 150, 255)),
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(15, 0, 15, 0),
-                Padding = new Thickness(15)
+                Background = new SolidColorBrush(Color.FromArgb(210, 11, 16, 28)),
+                CornerRadius = new CornerRadius(14),
+                BorderBrush = new LinearGradientBrush
+                {
+                    StartPoint = new Point(0, 0),
+                    EndPoint = new Point(1, 1),
+                    GradientStops = new GradientStopCollection
+                    {
+                        new GradientStop(Color.FromArgb(180, 0, 180, 255), 0.0),
+                        new GradientStop(Color.FromArgb(50, 15, 30, 55), 0.5),
+                        new GradientStop(Color.FromArgb(140, 0, 140, 255), 1.0)
+                    }
+                },
+                BorderThickness = new Thickness(1.5),
+                Margin = new Thickness(12, 0, 12, 0),
+                Padding = new Thickness(14, 12, 14, 12),
+                Effect = new DropShadowEffect
+                {
+                    Color = Color.FromRgb(0, 140, 255),
+                    BlurRadius = 22,
+                    ShadowDepth = 0,
+                    Opacity = 0.25
+                }
             };
 
             StackPanel sp = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
 
+            // Cockpit Instrument Cluster Header with Logo
+            StackPanel headSp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12) };
             string logoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
             if (File.Exists(logoPath))
             {
@@ -1397,13 +1505,13 @@ namespace AspireSense
                     Image imgCenter = new Image
                     {
                         Source = bmpCenter,
-                        Width = 72,
-                        Height = 72,
+                        Width = 56,
+                        Height = 56,
                         HorizontalAlignment = HorizontalAlignment.Center,
-                        Margin = new Thickness(0, 0, 0, 10),
-                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 26, ShadowDepth = 0, Opacity = 0.9 }
+                        Margin = new Thickness(0, 0, 0, 6),
+                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 24, ShadowDepth = 0, Opacity = 0.9 }
                     };
-                    sp.Children.Add(imgCenter);
+                    headSp.Children.Add(imgCenter);
                 }
                 catch { }
             }
@@ -1411,53 +1519,56 @@ namespace AspireSense
             {
                 Path logoCenter = new Path
                 {
-                    Width = 56,
-                    Height = 56,
+                    Width = 46,
+                    Height = 46,
                     Stretch = Stretch.Fill,
                     HorizontalAlignment = HorizontalAlignment.Center,
-                    Fill = new LinearGradientBrush
-                    {
-                        StartPoint = new Point(0, 0),
-                        EndPoint = new Point(1, 1),
-                        GradientStops = new GradientStopCollection
-                        {
-                            new GradientStop(Color.FromRgb(0, 225, 255), 0.0),
-                            new GradientStop(Color.FromRgb(0, 100, 255), 0.7),
-                            new GradientStop(Color.FromRgb(0, 40, 180), 1.0)
-                        }
-                    },
+                    Fill = new LinearGradientBrush(Color.FromRgb(0, 225, 255), Color.FromRgb(0, 100, 255), 45),
                     Data = Geometry.Parse("M 20,2 L 38,36 L 30,36 L 24,24 L 16,24 L 10,36 L 2,36 Z M 20,11 L 18,18 L 22,18 Z"),
-                    Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 25, ShadowDepth = 0, Opacity = 0.85 },
-                    Margin = new Thickness(0, 0, 0, 10)
+                    Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 22, ShadowDepth = 0, Opacity = 0.85 },
+                    Margin = new Thickness(0, 0, 0, 6)
                 };
-                sp.Children.Add(logoCenter);
+                headSp.Children.Add(logoCenter);
             }
 
             TextBlock title = new TextBlock
             {
-                Text = "COOLING MASTER",
+                Text = "DRIVE MODE SELECTOR",
                 FontSize = 13,
                 FontWeight = FontWeights.Black,
                 Foreground = Brushes.White,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 0, 0, 15)
+                HorizontalAlignment = HorizontalAlignment.Center
             };
-            sp.Children.Add(title);
+            headSp.Children.Add(title);
 
-            UniformGrid toggleGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 0, 0, 18) };
+            TextBlock subTitle = new TextBlock
+            {
+                Text = "COCKPIT ACTIVE CHASSIS CONTROL",
+                FontSize = 8,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(100, 150, 205)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            headSp.Children.Add(subTitle);
+            sp.Children.Add(headSp);
 
-            btnMax = CreateFancyButton("❄️ MAX", Color.FromRgb(0, 140, 255), false, () => ApplyMode(1, "100% MAXIMUM TURBO"));
-            btnAuto = CreateFancyButton("⚙️ AUTO", Color.FromRgb(0, 210, 255), true, () => ApplyMode(0, "DYNAMIC AUTO (WHISPER QUIET)"));
-            btnQuiet = CreateFancyButton("🌙 QUIET", Color.FromRgb(56, 189, 248), false, () => ApplyMode(3, "SILENT / ECO"));
+            // 3 Sports Car Cockpit Switches: ECO | DYNAMIC | SPORT+
+            UniformGrid toggleGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 0, 0, 14) };
 
-            toggleGrid.Children.Add(btnMax);
-            toggleGrid.Children.Add(btnAuto);
+            btnQuiet = CreateDriveModeButton("🌙 ECO", "SILENT • 28%", Color.FromRgb(0, 229, 255), false, () => ApplyMode(3, "SILENT / ECO (WHISPER QUIET)"));
+            btnAuto = CreateDriveModeButton("⚙️ DYNAMIC", "AUTO • ADAPTIVE", Color.FromRgb(0, 144, 255), true, () => ApplyMode(0, "DYNAMIC AUTO (ADAPTIVE BALANCED)"));
+            btnMax = CreateDriveModeButton("🚀 SPORT+", "MAX • 100%", Color.FromRgb(255, 30, 86), false, () => ApplyMode(1, "SPORT+ 100% MAXIMUM TURBO"));
+
             toggleGrid.Children.Add(btnQuiet);
+            toggleGrid.Children.Add(btnAuto);
+            toggleGrid.Children.Add(btnMax);
             sp.Children.Add(toggleGrid);
 
+            // Automotive Manual Throttle Console
             Border overrideBox = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(160, 15, 23, 42)),
+                Background = new SolidColorBrush(Color.FromArgb(170, 13, 20, 34)),
                 CornerRadius = new CornerRadius(8),
                 BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 160, 255)),
                 BorderThickness = new Thickness(1),
@@ -1467,13 +1578,19 @@ namespace AspireSense
             StackPanel overSp = new StackPanel();
 
             Grid sliderHeader = new Grid();
-            sliderHeader.Children.Add(new TextBlock { Text = "MANUAL FAN SPEED", FontSize = 10, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(140, 180, 230)) });
+            sliderHeader.Children.Add(new TextBlock
+            {
+                Text = "MANUAL FAN THROTTLE",
+                FontSize = 9.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(130, 170, 215))
+            });
             lblCustomVal = new TextBlock
             {
-                Text = "75%",
+                Text = "75% DUTY",
                 FontSize = 11,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255)),
+                FontWeight = FontWeights.Black,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255)),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
             sliderHeader.Children.Add(lblCustomVal);
@@ -1485,18 +1602,18 @@ namespace AspireSense
                 Maximum = 100,
                 Value = 75,
                 TickFrequency = 5,
-                Margin = new Thickness(0, 8, 0, 8)
+                Margin = new Thickness(0, 6, 0, 8)
             };
-            sliderCustom.ValueChanged += (s, e) => { lblCustomVal.Text = string.Format("{0:F0}%", sliderCustom.Value); };
+            sliderCustom.ValueChanged += (s, e) => { lblCustomVal.Text = string.Format("{0:F0}% DUTY", sliderCustom.Value); };
             overSp.Children.Add(sliderCustom);
 
             Button btnApplyCustom = new Button
             {
-                Content = "APPLY MANUAL OVERRIDE",
-                FontSize = 10.5,
-                FontWeight = FontWeights.Bold,
+                Content = "⚡ ENGAGE THROTTLE OVERRIDE",
+                FontSize = 10,
+                FontWeight = FontWeights.Black,
                 Foreground = Brushes.White,
-                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 80, 200), 45),
+                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 75, 185), 45),
                 BorderThickness = new Thickness(0),
                 Height = 30,
                 Cursor = Cursors.Hand
@@ -1509,10 +1626,10 @@ namespace AspireSense
                 {
                     currentFanMode = 6;
                     currentCustomDuty = target;
-                    lblStatusMsg.Text = string.Format("MANUAL OVERRIDE ({0}%) APPLIED", target);
-                    HighlightButton(btnAuto, false);
-                    HighlightButton(btnQuiet, false);
-                    HighlightButton(btnMax, false);
+                    lblStatusMsg.Text = string.Format("MANUAL THROTTLE ({0}%) LOCKED", target);
+                    UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
+                    UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
+                    UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
                 }
             };
             overSp.Children.Add(btnApplyCustom);
@@ -1524,31 +1641,85 @@ namespace AspireSense
             return card;
         }
 
-        private Border CreateFancyButton(string text, Color accent, bool isSelected, Action onClick)
+        private Border CreateDriveModeButton(string text, string subtitle, Color accent, bool isSelected, Action onClick)
         {
             Border b = new Border
             {
-                Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, accent.R, accent.G, accent.B)) : new SolidColorBrush(Color.FromArgb(140, 18, 25, 42)),
-                BorderBrush = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(80, 50, 70, 100)),
+                Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, accent.R, accent.G, accent.B)) : new SolidColorBrush(Color.FromArgb(130, 14, 20, 34)),
+                BorderBrush = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(70, 40, 60, 90)),
                 BorderThickness = new Thickness(1.5),
-                CornerRadius = new CornerRadius(6),
-                Margin = new Thickness(4),
-                Padding = new Thickness(6, 12, 6, 12),
-                Cursor = Cursors.Hand
+                CornerRadius = new CornerRadius(8),
+                Margin = new Thickness(4, 0, 4, 0),
+                Padding = new Thickness(6, 10, 6, 10),
+                Cursor = Cursors.Hand,
+                Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 14, ShadowDepth = 0, Opacity = 0.6 } : null
             };
+
+            StackPanel sp = new StackPanel();
+
+            Border led = new Border
+            {
+                Width = 18,
+                Height = 3,
+                CornerRadius = new CornerRadius(1.5),
+                Background = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(60, 60, 80, 110)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            sp.Children.Add(led);
 
             TextBlock tb = new TextBlock
             {
                 Text = text,
                 FontSize = 11.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(180, 200, 230)),
+                FontWeight = FontWeights.Black,
+                Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(160, 185, 215)),
                 HorizontalAlignment = HorizontalAlignment.Center
             };
-            b.Child = tb;
+            sp.Children.Add(tb);
 
+            TextBlock sub = new TextBlock
+            {
+                Text = subtitle,
+                FontSize = 8,
+                FontWeight = FontWeights.Bold,
+                Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : new SolidColorBrush(Color.FromRgb(100, 130, 160)),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 3, 0, 0)
+            };
+            sp.Children.Add(sub);
+
+            b.Child = sp;
             b.MouseDown += (s, e) => { onClick(); };
             return b;
+        }
+
+        private void UpdateDriveModeButton(Border b, bool isSelected, Color accent)
+        {
+            if (b == null) return;
+            b.Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, accent.R, accent.G, accent.B)) : new SolidColorBrush(Color.FromArgb(130, 14, 20, 34));
+            b.BorderBrush = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(70, 40, 60, 90));
+            b.Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 14, ShadowDepth = 0, Opacity = 0.6 } : null;
+
+            StackPanel sp = b.Child as StackPanel;
+            if (sp != null && sp.Children.Count >= 3)
+            {
+                Border led = sp.Children[0] as Border;
+                if (led != null)
+                {
+                    led.Background = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(60, 60, 80, 110));
+                }
+                TextBlock tb = sp.Children[1] as TextBlock;
+                if (tb != null)
+                {
+                    tb.Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(160, 185, 215));
+                }
+                TextBlock sub = sp.Children[2] as TextBlock;
+                if (sub != null)
+                {
+                    sub.Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : new SolidColorBrush(Color.FromRgb(100, 130, 160));
+                }
+            }
         }
 
         private void ApplyMode(int mode, string desc)
@@ -1557,21 +1728,9 @@ namespace AspireSense
             HardwareBridge.SetFanMode(mode);
             lblStatusMsg.Text = desc;
 
-            HighlightButton(btnAuto, mode == 0);
-            HighlightButton(btnMax, mode == 1);
-            HighlightButton(btnQuiet, mode == 3);
-        }
-
-        private void HighlightButton(Border b, bool isSelected)
-        {
-            if (b == null) return;
-            b.Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, 0, 180, 255)) : new SolidColorBrush(Color.FromArgb(140, 18, 25, 42));
-            b.BorderBrush = isSelected ? new SolidColorBrush(Color.FromRgb(0, 210, 255)) : new SolidColorBrush(Color.FromArgb(80, 50, 70, 100));
-            TextBlock tb = b.Child as TextBlock;
-            if (tb != null)
-            {
-                tb.Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(180, 200, 230));
-            }
+            UpdateDriveModeButton(btnQuiet, mode == 3, Color.FromRgb(0, 229, 255));
+            UpdateDriveModeButton(btnAuto, mode == 0, Color.FromRgb(0, 144, 255));
+            UpdateDriveModeButton(btnMax, mode == 1, Color.FromRgb(255, 30, 86));
         }
 
         private Grid CreateGamingToolsHub()
@@ -1676,8 +1835,9 @@ namespace AspireSense
         // ==========================================
         private Grid CreateCoolingView()
         {
-            Grid g = new Grid { Margin = new Thickness(35, 15, 35, 15) };
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(200) });
+            Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(145) });
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(70) });
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // Top: Dual Detailed Fan Cards
@@ -1685,28 +1845,30 @@ namespace AspireSense
             topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            // CPU Fan Card
-            Border cpuCard = CreateSectionCard("CPU DEDICATED COOLING BLOWER", "Intel Core Thermal Extraction");
-            StackPanel cpuSp = new StackPanel { Margin = new Thickness(20, 15, 20, 15) };
-            lblCoolingCpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 28, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)) };
-            progCoolingCpu = new ProgressBar { Height = 14, Minimum = 0, Maximum = 100, Value = 50, Margin = new Thickness(0, 10, 0, 10), Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)) };
-            TextBlock cpuSub = new TextBlock { Text = "Dynamic curve active: Ramps smoothly based on package temp", FontSize = 10.5, Foreground = Brushes.Silver };
+            // CPU Dedicated Blower Card
+            Border cpuCard = CreateSectionCard("CPU DEDICATED COOLING BLOWER", "Intel Core™ 5 210H Thermal Extraction");
+            StackPanel cpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
+            lblCoolingCpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255)) };
+            meterCoolingCpu = new SegmentedMeter(20, Color.FromRgb(0, 229, 255), 12, 6);
+            meterCoolingCpu.Margin = new Thickness(0, 8, 0, 8);
+            TextBlock cpuSub = new TextBlock { Text = "Dynamic curve active: Ramps smoothly based on CPU package temp", FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(140, 170, 205)) };
             cpuSp.Children.Add(lblCoolingCpuRpm);
-            cpuSp.Children.Add(progCoolingCpu);
+            cpuSp.Children.Add(meterCoolingCpu);
             cpuSp.Children.Add(cpuSub);
             cpuCard.Child = cpuSp;
             Grid.SetColumn(cpuCard, 0);
             topRow.Children.Add(cpuCard);
 
-            // GPU Fan Card
-            Border gpuCard = CreateSectionCard("GPU DEDICATED COOLING BLOWER", "NVIDIA RTX 4050 Thermal Extraction");
-            gpuCard.Margin = new Thickness(15, 0, 0, 0);
-            StackPanel gpuSp = new StackPanel { Margin = new Thickness(20, 15, 20, 15) };
-            lblCoolingGpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 28, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248)) };
-            progCoolingGpu = new ProgressBar { Height = 14, Minimum = 0, Maximum = 100, Value = 0, Margin = new Thickness(0, 10, 0, 10), Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248)) };
-            TextBlock gpuSub = new TextBlock { Text = "Zero-RPM mode enabled: Fan completely turns off when GPU is idle", FontSize = 10.5, Foreground = Brushes.Silver };
+            // GPU Dedicated Blower Card
+            Border gpuCard = CreateSectionCard("GPU DEDICATED COOLING BLOWER", "NVIDIA GeForce RTX 4050 Thermal Extraction");
+            gpuCard.Margin = new Thickness(14, 0, 0, 0);
+            StackPanel gpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
+            lblCoolingGpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248)) };
+            meterCoolingGpu = new SegmentedMeter(20, Color.FromRgb(56, 189, 248), 12, 6);
+            meterCoolingGpu.Margin = new Thickness(0, 8, 0, 8);
+            TextBlock gpuSub = new TextBlock { Text = "Zero-RPM passive mode: Blower completely idles when GPU is cold", FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(140, 170, 205)) };
             gpuSp.Children.Add(lblCoolingGpuRpm);
-            gpuSp.Children.Add(progCoolingGpu);
+            gpuSp.Children.Add(meterCoolingGpu);
             gpuSp.Children.Add(gpuSub);
             gpuCard.Child = gpuSp;
             Grid.SetColumn(gpuCard, 1);
@@ -1715,36 +1877,116 @@ namespace AspireSense
             Grid.SetRow(topRow, 0);
             g.Children.Add(topRow);
 
-            // Bottom: Fan Curve Table & Fine Tuning
-            Border bottomCard = CreateSectionCard("HARDWARE FAN CURVE ARCHITECTURE", "Insyde / Clevo Embedded Controller Fan Table");
-            bottomCard.Margin = new Thickness(0, 15, 0, 0);
+            // Middle: 60-Second Turbo Heat Flush Card
+            Border flushCard = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(170, 12, 22, 38)),
+                CornerRadius = new CornerRadius(8),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 10, 0, 0),
+                Padding = new Thickness(16, 8, 16, 8)
+            };
+            Grid flushGrid = new Grid();
+            flushGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            flushGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
 
-            StackPanel botSp = new StackPanel { Margin = new Thickness(25, 20, 25, 20) };
+            StackPanel fLeft = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            fLeft.Children.Add(new TextBlock
+            {
+                Text = "❄️ 60-SECOND TURBO HEAT FLUSH",
+                FontSize = 12,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White
+            });
+            fLeft.Children.Add(new TextBlock
+            {
+                Text = "Instantly cycles blowers at 100% duty for 60 seconds to rapidly purge heat pipes, then auto-restores.",
+                FontSize = 9.5,
+                Foreground = new SolidColorBrush(Color.FromRgb(130, 165, 200)),
+                Margin = new Thickness(0, 2, 0, 0)
+            });
+            Grid.SetColumn(fLeft, 0);
+            flushGrid.Children.Add(fLeft);
+
+            btnHeatFlush = new Border
+            {
+                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 70, 180), 45),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Height = 36,
+                Cursor = Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            lblHeatFlushText = new TextBlock
+            {
+                Text = "❄️ ENGAGE TURBO FLUSH",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            btnHeatFlush.Child = lblHeatFlushText;
+            btnHeatFlush.MouseDown += (s, e) =>
+            {
+                if (heatFlushRemaining > 0)
+                {
+                    heatFlushRemaining = 0;
+                    ApplyMode(0, "DYNAMIC AUTO (HEAT FLUSH CANCELLED)");
+                    lblHeatFlushText.Text = "❄️ ENGAGE TURBO FLUSH";
+                }
+                else
+                {
+                    heatFlushRemaining = 60;
+                    ApplyMode(1, "60s TURBO HEAT FLUSH ENGAGED");
+                    lblHeatFlushText.Text = "❄️ FLUSHING... (60s LEFT)";
+                }
+            };
+            Grid.SetColumn(btnHeatFlush, 1);
+            flushGrid.Children.Add(btnHeatFlush);
+
+            flushCard.Child = flushGrid;
+            Grid.SetRow(flushCard, 1);
+            g.Children.Add(flushCard);
+
+            // Bottom: Fan Curve Architecture & Fine Override
+            Border bottomCard = CreateSectionCard("HARDWARE FAN CURVE ARCHITECTURE", "Insyde Embedded Controller Dynamic 4-Stage Curve");
+            bottomCard.Margin = new Thickness(0, 10, 0, 0);
+
+            StackPanel botSp = new StackPanel { Margin = new Thickness(18, 12, 18, 12) };
 
             TextBlock intro = new TextBlock
             {
-                Text = "Your laptop's EC hardware monitors temperatures every 250ms and dynamically calculates RPM according to 4 calibrated thermal stages:",
-                FontSize = 11.5,
-                Foreground = Brushes.White,
-                Margin = new Thickness(0, 0, 0, 15)
+                Text = "EC hardware monitors temperatures continuously and modulates blower speed across 4 calibrated thermal stages:",
+                FontSize = 10.5,
+                Foreground = new SolidColorBrush(Color.FromRgb(160, 185, 215)),
+                Margin = new Thickness(0, 0, 0, 10)
             };
             botSp.Children.Add(intro);
 
-            UniformGrid curveGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 20) };
-            curveGrid.Children.Add(CreateCurveStep("STAGE 1 (IDLE)", "45 °C", "28% Duty (Quiet)"));
-            curveGrid.Children.Add(CreateCurveStep("STAGE 2 (NORMAL)", "60 °C", "50% Duty (Balanced)"));
-            curveGrid.Children.Add(CreateCurveStep("STAGE 3 (GAMING)", "80 °C", "66% Duty (High Airflow)"));
-            curveGrid.Children.Add(CreateCurveStep("STAGE 4 (PEAK)", "100 °C", "100% Duty (Full Turbo)"));
+            curveCards.Clear();
+            UniformGrid curveGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 14) };
+            curveCards.Add(CreateCurveStep("STAGE 1 (IDLE)", "< 50 °C", "28% Duty (Whisper Quiet)"));
+            curveCards.Add(CreateCurveStep("STAGE 2 (CRUISE)", "50 - 70 °C", "50% Duty (Balanced Daily)"));
+            curveCards.Add(CreateCurveStep("STAGE 3 (GAMING)", "70 - 85 °C", "66% Duty (High Airflow)"));
+            curveCards.Add(CreateCurveStep("STAGE 4 (PEAK)", "> 85 °C", "100% Duty (Full Turbo Lock)"));
+
+            foreach (Border cCard in curveCards)
+            {
+                curveGrid.Children.Add(cCard);
+            }
             botSp.Children.Add(curveGrid);
 
             // Dedicated Custom Fan Slider
-            Grid sliderRow = new Grid { Margin = new Thickness(0, 10, 0, 0) };
-            sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(200) });
+            Grid sliderRow = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+            sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
             sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
             sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
 
-            TextBlock lblDed = new TextBlock { Text = "Fine Manual Override:", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
+            TextBlock lblDed = new TextBlock { Text = "Fine Manual Override:", FontSize = 11, FontWeight = FontWeights.Bold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(lblDed, 0);
             sliderRow.Children.Add(lblDed);
 
@@ -1753,19 +1995,19 @@ namespace AspireSense
             Grid.SetColumn(sliderDedicatedCustom, 1);
             sliderRow.Children.Add(sliderDedicatedCustom);
 
-            lblDedicatedCustomVal = new TextBlock { Text = "80%", FontSize = 13, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Center };
+            lblDedicatedCustomVal = new TextBlock { Text = "80%", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Center };
             Grid.SetColumn(lblDedicatedCustomVal, 2);
             sliderRow.Children.Add(lblDedicatedCustomVal);
 
             Button btnApplyDed = new Button
             {
                 Content = "Apply Fan Duty",
-                FontSize = 11,
+                FontSize = 10.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
                 Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 80, 200), 45),
                 BorderThickness = new Thickness(0),
-                Height = 32,
+                Height = 30,
                 Cursor = Cursors.Hand
             };
             btnApplyDed.Click += (s, e) =>
@@ -1777,6 +2019,9 @@ namespace AspireSense
                     currentFanMode = 6;
                     currentCustomDuty = val;
                     lblStatusMsg.Text = string.Format("CUSTOM FAN SPEED ({0}%) LOCKED", val);
+                    UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
+                    UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
+                    UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
                 }
             };
             Grid.SetColumn(btnApplyDed, 3);
@@ -1784,7 +2029,7 @@ namespace AspireSense
 
             botSp.Children.Add(sliderRow);
             bottomCard.Child = botSp;
-            Grid.SetRow(bottomCard, 1);
+            Grid.SetRow(bottomCard, 2);
             g.Children.Add(bottomCard);
 
             return g;
@@ -1827,32 +2072,94 @@ namespace AspireSense
         // ==========================================
         private Grid CreateGamingView()
         {
-            Grid g = new Grid { Margin = new Thickness(35, 15, 35, 15) };
+            Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(140) });
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) });
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // Top: Scenario Profiles
             Border scenCard = CreateSectionCard("PERFORMANCE & GAMING SCENARIOS", "Instant System Clock & Cooling Profiles");
-            StackPanel scenSp = new StackPanel { Margin = new Thickness(15, 10, 15, 10) };
+            StackPanel scenSp = new StackPanel { Margin = new Thickness(14, 8, 14, 8) };
 
-            lblScenarioStatus = new TextBlock { Text = "Current Active Scenario: High Performance Gaming", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), Margin = new Thickness(0, 0, 0, 10) };
-            scenSp.Children.Add(lblScenarioStatus);
+            Grid scenHeader = new Grid();
+            scenHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            scenHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
 
-            UniformGrid scenGrid = new UniformGrid { Columns = 3 };
+            lblScenarioStatus = new TextBlock
+            {
+                Text = "Current Profile: Dynamic Auto (Balanced)",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(lblScenarioStatus, 0);
+            scenHeader.Children.Add(lblScenarioStatus);
+
+            // 1-Click ULTRA GAME BOOST Button
+            Border btnUltraBoost = new Border
+            {
+                Background = new LinearGradientBrush(Color.FromRgb(255, 30, 86), Color.FromRgb(180, 10, 50), 45),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(255, 100, 140)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 5, 10, 5),
+                Cursor = Cursors.Hand
+            };
+            btnUltraBoost.Child = new TextBlock
+            {
+                Text = "🚀 ULTRA GAME BOOST",
+                FontSize = 10.5,
+                FontWeight = FontWeights.Black,
+                Foreground = Brushes.White,
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            btnUltraBoost.MouseDown += (s, e) =>
+            {
+                ApplyMode(1, "ULTRA GAME BOOST ACTIVE (100% TURBO COOLING)");
+                HardwareBridge.OptimizeMemory();
+                winKeyLocked = true;
+                if (btnWinLock != null)
+                {
+                    TextBlock tb = btnWinLock.Child as TextBlock;
+                    if (tb != null) tb.Text = "🔒 WIN-KEY: LOCKED";
+                }
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo("powercfg", "/setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    Process.Start(psi);
+                }
+                catch { }
+
+                lblScenarioStatus.Text = "🚀 ULTRA GAME BOOST ACTIVE (100% FAN + RAM PURGED + WIN-KEY LOCKED)";
+                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+            };
+            Grid.SetColumn(btnUltraBoost, 1);
+            scenHeader.Children.Add(btnUltraBoost);
+            scenSp.Children.Add(scenHeader);
+
+            UniformGrid scenGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 8, 0, 0) };
             scenGrid.Children.Add(CreateScenarioBtn("🚀 TURBO GAMING", "Maximum FPS, full cooling, zero throttle", () =>
             {
                 ApplyMode(1, "100% MAXIMUM TURBO");
-                lblScenarioStatus.Text = "Current Active Scenario: Turbo Gaming Mode";
+                lblScenarioStatus.Text = "Active Profile: Turbo Gaming Mode";
+                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 90));
             }));
             scenGrid.Children.Add(CreateScenarioBtn("⚖️ BALANCED DAILY", "Optimized thermals and power balance", () =>
             {
                 ApplyMode(0, "DYNAMIC AUTO (BALANCED)");
-                lblScenarioStatus.Text = "Current Active Scenario: Balanced Daily Mode";
+                lblScenarioStatus.Text = "Active Profile: Balanced Daily Mode";
+                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
             }));
             scenGrid.Children.Add(CreateScenarioBtn("🍃 ECO & SILENT", "Whisper-quiet fans, maximum battery life", () =>
             {
                 ApplyMode(3, "SILENT / ECO");
-                lblScenarioStatus.Text = "Current Active Scenario: Eco & Silent Mode";
+                lblScenarioStatus.Text = "Active Profile: Eco & Silent Mode";
+                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
             }));
             scenSp.Children.Add(scenGrid);
 
@@ -1860,13 +2167,72 @@ namespace AspireSense
             Grid.SetRow(scenCard, 0);
             g.Children.Add(scenCard);
 
+            // Middle: Live Gaming Network Ping Telemetry Ribbon
+            Border pingRibbon = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(170, 10, 16, 28)),
+                CornerRadius = new CornerRadius(8),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 8, 0, 0),
+                Padding = new Thickness(16, 8, 16, 8)
+            };
+            Grid pingGrid = new Grid();
+            pingGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            pingGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+
+            StackPanel pLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            pLeft.Children.Add(new TextBlock
+            {
+                Text = "🌐 MULTIPLAYER NETWORK TELEMETRY:  ",
+                FontSize = 10,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(120, 155, 195))
+            });
+            lblGamePing = new TextBlock
+            {
+                Text = "CHECKING CDN LATENCY...",
+                FontSize = 11,
+                FontWeight = FontWeights.Black,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140))
+            };
+            pLeft.Children.Add(lblGamePing);
+            Grid.SetColumn(pLeft, 0);
+            pingGrid.Children.Add(pLeft);
+
+            Border btnPingNow = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(140, 18, 26, 42)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 180, 255)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(8, 4, 8, 4),
+                Cursor = Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            btnPingNow.Child = new TextBlock
+            {
+                Text = "⚡ PING NOW",
+                FontSize = 9.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            btnPingNow.MouseDown += (s, e) => { CheckPingAsync(); };
+            Grid.SetColumn(btnPingNow, 1);
+            pingGrid.Children.Add(btnPingNow);
+
+            pingRibbon.Child = pingGrid;
+            Grid.SetRow(pingRibbon, 1);
+            g.Children.Add(pingRibbon);
+
             // Bottom: Tools & System Launchers
             Border toolsCard = CreateSectionCard("GAMING UTILITIES & HARDWARE ACCELERATION", "Fast access to critical performance tools");
-            toolsCard.Margin = new Thickness(0, 15, 0, 0);
+            toolsCard.Margin = new Thickness(0, 8, 0, 0);
 
-            StackPanel tSp = new StackPanel { Margin = new Thickness(20) };
+            StackPanel tSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
 
-            UniformGrid utilGrid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 10, 0, 0) };
+            UniformGrid utilGrid = new UniformGrid { Columns = 2 };
             utilGrid.Children.Add(CreateLauncherTile("🎮 NVIDIA Control Panel", "Tweak 3D settings, G-Sync & Max Frame Rates", () =>
             {
                 try { Process.Start("control.exe", "/name Microsoft.NvidiaControlPanel"); } catch { }
@@ -1883,13 +2249,76 @@ namespace AspireSense
             {
                 try { Process.Start("ms-settings:powersleep"); } catch { }
             }));
+            utilGrid.Children.Add(CreateLauncherTile("🖥️ Windows Graphics Settings", "Configure Hardware-Accelerated GPU Scheduling (HAGS)", () =>
+            {
+                try { Process.Start("ms-settings:display-advancedgraphicsettings"); } catch { }
+            }));
+            utilGrid.Children.Add(CreateLauncherTile("📁 AspireSense Folder", "Open application install location & logs", () =>
+            {
+                try { Process.Start("explorer.exe", AppDomain.CurrentDomain.BaseDirectory); } catch { }
+            }));
 
             tSp.Children.Add(utilGrid);
             toolsCard.Child = tSp;
-            Grid.SetRow(toolsCard, 1);
+            Grid.SetRow(toolsCard, 2);
             g.Children.Add(toolsCard);
 
             return g;
+        }
+
+        private void CheckPingAsync()
+        {
+            ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                try
+                {
+                    using (System.Net.NetworkInformation.Ping p = new System.Net.NetworkInformation.Ping())
+                    {
+                        System.Net.NetworkInformation.PingReply reply = p.Send("1.1.1.1", 1200);
+                        if (reply != null && reply.Status == System.Net.NetworkInformation.IPStatus.Success)
+                        {
+                            int rtt = (int)reply.RoundtripTime;
+                            this.Dispatcher.BeginInvoke((Action)delegate
+                            {
+                                lastPingMs = rtt;
+                                UpdatePingDisplay(rtt);
+                            });
+                        }
+                        else
+                        {
+                            this.Dispatcher.BeginInvoke((Action)delegate
+                            {
+                                UpdatePingDisplay(-1);
+                            });
+                        }
+                    }
+                }
+                catch
+                {
+                    this.Dispatcher.BeginInvoke((Action)delegate
+                    {
+                        UpdatePingDisplay(-1);
+                    });
+                }
+            });
+        }
+
+        private void UpdatePingDisplay(int rtt)
+        {
+            if (lblGamePing == null) return;
+            if (rtt >= 0)
+            {
+                string qual = (rtt < 40) ? "OPTIMAL LOW LATENCY" : ((rtt < 80) ? "GOOD" : "HIGH");
+                lblGamePing.Text = string.Format("{0} ms ({1})", rtt, qual);
+                if (rtt < 40) lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                else if (rtt < 80) lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
+                else lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(255, 170, 0));
+            }
+            else
+            {
+                lblGamePing.Text = "PING TIMEOUT / OFFLINE";
+                lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 60));
+            }
         }
 
         private Border CreateScenarioBtn(string title, string desc, Action act)
@@ -2412,7 +2841,42 @@ namespace AspireSense
             {
                 HardwareBridge.SensorData d = HardwareBridge.ReadSensors(cpuCounter);
 
-                // Update Dashboard Speedometers
+                // 1. Update 60-Second Turbo Heat Flush Countdown
+                if (heatFlushRemaining > 0)
+                {
+                    heatFlushRemaining--;
+                    if (lblHeatFlushText != null)
+                    {
+                        lblHeatFlushText.Text = string.Format("❄️ FLUSHING... ({0}s LEFT)", heatFlushRemaining);
+                    }
+                    if (heatFlushRemaining == 0)
+                    {
+                        HardwareBridge.SetFanMode(0);
+                        currentFanMode = 0;
+                        if (lblHeatFlushText != null)
+                        {
+                            lblHeatFlushText.Text = "❄️ ENGAGE TURBO FLUSH";
+                        }
+                        if (lblStatusMsg != null)
+                        {
+                            lblStatusMsg.Text = "DYNAMIC AUTO (HEAT FLUSH COMPLETE)";
+                            lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255));
+                        }
+                        UpdateDriveModeButton(btnAuto, true, Color.FromRgb(0, 144, 255));
+                        UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
+                        UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
+                    }
+                }
+
+                // 2. Periodic Network Latency Ping (Every 5 Seconds)
+                pingTick++;
+                if (pingTick >= 5)
+                {
+                    pingTick = 0;
+                    CheckPingAsync();
+                }
+
+                // 3. Update Dashboard Speedometers
                 if (cpuSpeedo != null)
                 {
                     cpuSpeedo.Update(d.CpuUsage, d.CpuTemp, d.CpuRpm, d.CpuDuty);
@@ -2422,16 +2886,31 @@ namespace AspireSense
                     gpuSpeedo.Update(d.GpuUsage, d.GpuTemp, d.GpuRpm, d.GpuDuty);
                 }
 
-                // Update Cooling View
+                // 4. Update Cooling View Blowers & Meters
                 if (lblCoolingCpuRpm != null)
                 {
                     lblCoolingCpuRpm.Text = string.Format("{0} RPM ({1}%)", d.CpuRpm, d.CpuDuty);
-                    progCoolingCpu.Value = d.CpuDuty;
+                    if (meterCoolingCpu != null) meterCoolingCpu.SetValue(d.CpuDuty);
                 }
                 if (lblCoolingGpuRpm != null)
                 {
-                    lblCoolingGpuRpm.Text = string.Format("{0} RPM ({1}%)", d.GpuRpm, d.GpuDuty);
-                    progCoolingGpu.Value = d.GpuDuty;
+                    lblCoolingGpuRpm.Text = (d.GpuRpm > 0) ? string.Format("{0} RPM ({1}%)", d.GpuRpm, d.GpuDuty) : "0 RPM (PASSIVE IDLE)";
+                    if (meterCoolingGpu != null) meterCoolingGpu.SetValue(d.GpuDuty);
+                }
+
+                // 5. Update Dynamic 4-Stage Hardware Fan Curve Active Stage
+                int maxTemp = Math.Max(d.CpuTemp, d.GpuTemp);
+                int activeStage = 0;
+                if (maxTemp >= 85) activeStage = 3;
+                else if (maxTemp >= 70) activeStage = 2;
+                else if (maxTemp >= 50) activeStage = 1;
+                else activeStage = 0;
+
+                for (int i = 0; i < curveCards.Count; i++)
+                {
+                    bool isActive = (i == activeStage);
+                    curveCards[i].BorderBrush = isActive ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : new SolidColorBrush(Color.FromArgb(70, 0, 160, 255));
+                    curveCards[i].Background = isActive ? new SolidColorBrush(Color.FromArgb(200, 15, 35, 65)) : new SolidColorBrush(Color.FromArgb(160, 18, 25, 42));
                 }
 
                 latestSensorData = d;
@@ -2548,9 +3027,9 @@ namespace AspireSense
                             lblStatusMsg.Text = "⚠️ THERMAL WATCHDOG: HIGH HEAT (AUTO TURBO ENGAGED)";
                             lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 60));
                         }
-                        HighlightButton(btnMax, true);
-                        HighlightButton(btnAuto, false);
-                        HighlightButton(btnQuiet, false);
+                        UpdateDriveModeButton(btnMax, true, Color.FromRgb(255, 30, 86));
+                        UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
+                        UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
                     }
                 }
             }
