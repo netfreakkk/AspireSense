@@ -1,0 +1,8 @@
+# Visual Studio / Build temporaries
+*.pdb
+*.bak
+*.tmp
+*.log
+.vs/
+bin/
+obj/
