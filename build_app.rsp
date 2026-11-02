@@ -1,0 +1,14 @@
+/target:winexe
+/platform:x64
+/win32manifest:app.manifest
+/win32icon:app.ico
+/out:AspireSense.exe
+/r:System.dll
+/r:System.Drawing.dll
+/r:System.Windows.Forms.dll
+/r:System.Xaml.dll
+/r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Management.dll
+/r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationCore.dll
+/r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\PresentationFramework.dll
+/r:C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF\WindowsBase.dll
+/recurse:src\*.cs

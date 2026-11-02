@@ -4,7 +4,7 @@
 
 # AspireSense (Open-Source Edition)
 
-A standalone, high-performance hardware monitor and cooling control cockpit for **Acer, ASUS, Lenovo, HP, Dell**, and compatible gaming laptops. Completely independent of bloated OEM companion software.
+A standalone, high-performance hardware monitor, cooling control cockpit, and anti-hallucination EC arbiter for **Acer, ASUS, Lenovo, HP, Dell**, and compatible gaming laptops. Completely independent of bloated OEM companion software.
 
 ---
 
@@ -16,11 +16,11 @@ A standalone, high-performance hardware monitor and cooling control cockpit for 
   - **Right (GPU)**: Direct NVIDIA NVML hardware sensor (0% when idle / on Firefox, exact match to Task Manager), temperature, and fan RPM.
 - **Center Cooling Master**:
   - **MAX (100% TURBO)**: Blasts fans to full speed.
-  - **AUTO**: Dynamic intelligent firmware curves (whisper quiet).
+  - **AUTO**: Dynamic intelligent firmware curves.
   - **QUIET**: Low-RPM eco profile.
-  - **Manual Speed Override**: Working hardware curve percentage slider (30% – 100% with Motor Stall & 100°C Overheat Protection).
+  - **Manual Speed Override**: Working hardware curve percentage slider (30% – 100% with Motor Stall & Overheat Protection).
 - **Active Hardware Thermal Watchdog**:
-  - Automatically overrides fans to Turbo if CPU exceeds 90°C or GPU exceeds 85°C.
+  - Automatically overrides fans to Turbo if CPU exceeds 92°C or GPU exceeds 86°C.
 - **Fail-Safe Crash & Exit Auto-Reset**:
   - Embedded Controller fan registers are guaranteed to restore to factory dynamic Auto mode on app close or termination.
 - **Quick Gaming Tools Hub**:
@@ -36,35 +36,88 @@ A standalone, high-performance hardware monitor and cooling control cockpit for 
   - Displays the 4 calibrated stages of your laptop's Embedded Controller: Stage 1 (45°C), Stage 2 (60°C), Stage 3 (80°C), and Stage 4 (100°C).
 - **Fine Manual Speed Override**:
   - Full-width slider with immediate hardware fan lock.
+- **Turbo Heat Flush**:
+  - 60-second high-velocity blower flush with automated auto-mode restoration.
 
-### 3. **Gaming Hub**
-- **Performance Scenarios**:
-  - 🚀 **Turbo Gaming**: Full cooling and performance profile.
-  - ⚖️ **Balanced Daily**: Auto fan curves and balanced power.
-  - 🍃 **Eco & Silent**: Energy saving and quiet fans.
-- **Game Acceleration Utilities**:
-  - NVIDIA Control Panel launcher.
-  - Windows Task Manager launcher.
-  - DirectX Diagnostic (DxDiag) launcher.
-  - Windows Power & Battery options launcher.
+### 3. **Gaming Hub & In-Game HUD Overlay**
+- **Zero-Hook DirectX ETW Telemetry**:
+  - Real-time FPS, 1% Lows, frame time, and GPU/CPU stats directly from DXGI present events.
+- **In-Game Overlay HUD**:
+  - Non-intrusive OSD (`Ctrl + Shift + O` global hotkey) with custom corner anchors and layout presets.
+- **Performance Scenarios & Network Diagnostics**:
+  - Instant scenario toggles and live low-jitter ICMP ping monitor.
 
-### 4. **System Health & Telemetry**
+### 4. **System Health & Hardware Telemetry**
 - **Hardware Identity**:
-  - Detected model: Acer Aspire A715-79G.
-  - GPU: NVIDIA GeForce RTX 4050 Laptop GPU (6 GB VRAM).
-  - CPU Cores, Insyde EC Controller v1.13, Windows 11 64-bit architecture.
-- **Memory & Power Health**:
-  - Live RAM bar (Used vs Available vs Total GB) with live load percentage.
-  - Live Battery & AC Power status (Plugged In vs On Battery with charge %).
-- **Local Storage Drives**:
-  - Live list of internal drives (C:\, etc.) with used/free capacity bars.
+  - Detected chassis model, CPU architecture, discrete GPU specifications, BIOS & EC firmware revisions.
+- **Memory, Battery & Storage Health**:
+  - Live RAM bar (Used vs Available vs Total GB) with top memory-consuming processes.
+  - Battery wear level, design vs full-charge capacity (Wh), and AC charging status.
+  - Drive storage headroom and thermal margins.
+
+### 5. **EC Anti-Hallucination Arbiter (Anti-Revving Engine)**
+- **Problem Solved**:
+  - Eliminates the notorious fan revving / jet engine ramping on modern laptops caused by Windows background tasks (e.g., Microsoft Compatibility Telemetry, Defender) and transient browser spikes.
+- **Thermal EMA (Exponential Moving Average)**:
+  - Models the real physical copper heatsink thermal mass ($\alpha = 0.15$), ignoring short 1–2 second silicon temperature spikes.
+- **Native Hardware Silent Mode (Mode 3)**:
+  - Applies Acer's native hardware silent acoustic profile during desktop tasks without constant register spamming.
+- **Automated 3D Gaming & Sustained Compute Unclamp**:
+  - Automatically detects when a 3D game launches or when sustained compute (> 4 seconds) begins, instantly unclamping fans to full cooling curves.
+- **Power Plan Boost Tamer**:
+  - Integrated 1-click toggle setting CPU maximum state to 99% via `powercfg`, eliminating micro-burst overvoltage while browsing without perceptible latency.
+- **Emergency Thermal Failsafe**:
+  - Immediate override to 100% Turbo fans if CPU reaches $\ge 86^\circ\text{C}$ or GPU reaches $\ge 85^\circ\text{C}$.
 
 ---
 
-## 🚀 100% Independent & Portable
-- **Zero dependencies on Control Center 3 (CC3)**.
-- **Won't break on future Windows updates**.
-- **Under 45 KB**, native hardware-accelerated WPF executable.
+## 🏗️ Production Modular Architecture
+
+AspireSense is structured into clean, maintainable modular layers under `src/`:
+
+```
+AspireSense/
+├── .gitignore
+├── app.ico
+├── app.manifest
+├── build.bat
+├── build_app.rsp
+├── build_installer.rsp
+├── Installer.cs
+├── InsydeDCHU.dll
+├── LICENSE
+├── logo.png
+├── README.md
+├── RELEASE_NOTES.md
+└── src/
+    ├── Program.cs                      # Single-instance Mutex & App Entry Point
+    ├── Common/
+    │   └── Enums.cs                    # HardwareVendor, OverlayPosition & Style enums
+    ├── Hardware/
+    │   ├── HardwareBridge.cs           # Unified multi-vendor dispatcher & sensor polling
+    │   ├── AcerInsydeBridge.cs         # Acer Aspire/Nitro/Predator Insyde DCHU DLL interop
+    │   ├── AsusAcpiBridge.cs           # ASUS TUF/ROG ATKACPI & WMI interop
+    │   ├── LenovoWmiBridge.cs          # Lenovo Legion/LOQ Vantage WMI interop
+    │   ├── HpWmiBridge.cs              # HP Omen/Victus WMI interop
+    │   └── DellWmiBridge.cs            # Dell Alienware/G-Series SMBIOS WMI interop
+    ├── Engine/
+    │   ├── EcAntiHallucinationEngine.cs # Heatsink thermal EMA, power tamer & arbiter rules
+    │   └── GameTelemetryEngine.cs      # Zero-hook DirectX 9/11/12 DXGI ETW frame tracer
+    └── UI/
+        ├── DesignTokens.cs             # Apple HIG dark mode tokens, brushes & styling
+        ├── MainWindow.cs               # Core window shell, navigation, layout & timer ticks
+        ├── Controls/
+        │   ├── SpeedometerGauge.cs     # Circular SVG-grade needle gauge
+        │   └── SegmentedMeter.cs       # Segmented LED bar meter
+        ├── Overlay/
+        │   └── MetricsOverlayWindow.cs # In-game transparent borderless HUD overlay
+        └── Views/
+            ├── MainWindow.Dashboard.cs # Tab 0: Dashboard view & quick modes
+            ├── MainWindow.Cooling.cs   # Tab 1: Cooling studio & fan curves
+            ├── MainWindow.Gaming.cs    # Tab 2: Gaming hub, OSD & network tools
+            ├── MainWindow.Health.cs    # Tab 3: System health & hardware specs
+            └── MainWindow.Arbiter.cs   # Tab 4: EC Anti-Hallucination Arbiter & logs
+```
 
 ---
 
@@ -77,7 +130,7 @@ Download **`AspireSense-Setup.exe`** from the [GitHub Releases](https://github.c
 - **Windows Integration**: Fully registered in Windows Settings > Apps & Features with clean 1-click uninstaller.
 
 ### Option 2: Portable Edition (No Install Required)
-Download **`AspireSense-Portable-v1.0.0.zip`**:
+Download **`AspireSense-Portable-v1.1.0.zip`**:
 - Extract anywhere and run **`AspireSense.exe`**.
 - Keep `InsydeDCHU.dll` in the same directory.
 
