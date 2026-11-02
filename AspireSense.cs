@@ -1959,7 +1959,7 @@ namespace AspireSense
                 return;
             }
 
-            // Rule 2: Active Gaming Unclamp (DirectX ETW)
+            // Rule 2: Active Gaming Unclamp (DirectX ETW or 3D GPU Load)
             if (isGaming && AutoUnclampGaming)
             {
                 CurrentClassifierState = "🎮 3D GAMING ACTIVE - FANS UNRESTRICTED";
@@ -1968,7 +1968,10 @@ namespace AspireSense
                     CurrentAppliedMode = 0;
                     IsCurrentlyClamped = false;
                     HardwareBridge.ResetToAuto();
-                    LogDecision("GAMING DETECTED via DirectX ETW -> Restored Auto cooling");
+                    string details = GameTelemetryEngine.IsGameActive ?
+                        string.Format("{0} ({1:F0} FPS)", GameTelemetryEngine.ActiveProcessName, GameTelemetryEngine.CurrentFps) :
+                        string.Format("GPU Load {0:F0}%", gpuUsage);
+                    LogDecision("GAMING DETECTED: " + details + " -> Restored Auto cooling");
                 }
                 return;
             }
@@ -2692,6 +2695,14 @@ namespace AspireSense
         public static uint ActiveProcessId = 0;
         public static bool IsEtwActive = false;
 
+        public static bool IsGameActive
+        {
+            get
+            {
+                return CurrentFps >= 10.0 && !string.IsNullOrEmpty(ActiveProcessName) && !IsSystemProcess(ActiveProcessName);
+            }
+        }
+
         private static volatile uint targetGamePid = 0;
         private static ulong sessionHandle = 0;
         private static IntPtr consumerHandle = IntPtr.Zero;
@@ -2959,7 +2970,7 @@ namespace AspireSense
                    low.Contains("startmenuexperiencehost") ||
                    low.Contains("applicationframehost") ||
                    low.Contains("lockapp") ||
-                   low.Contains("dwm.exe");
+                   low.Contains("dwm");
         }
 
         public static void UpdateMetrics()
@@ -6880,7 +6891,8 @@ namespace AspireSense
                 // 3b. Update EC Anti-Hallucination Arbiter Engine
                 if (currentFanMode != 1 && heatFlushRemaining == 0)
                 {
-                    EcAntiHallucinationEngine.Update(d.CpuTemp, d.GpuTemp, d.CpuUsage, d.GpuUsage, d.CpuWatts, GameTelemetryEngine.IsEtwActive);
+                    bool isGaming = GameTelemetryEngine.IsGameActive || (d.GpuUsage >= 45.0f && d.GpuTemp >= 58);
+                    EcAntiHallucinationEngine.Update(d.CpuTemp, d.GpuTemp, d.CpuUsage, d.GpuUsage, d.CpuWatts, isGaming);
                 }
                 UpdateDashboardEcGuardUi();
 
