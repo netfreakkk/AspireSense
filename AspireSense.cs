@@ -15,6 +15,7 @@ using System.Windows.Media;
 using System.Windows.Media.Effects;
 using System.Windows.Shapes;
 using System.Windows.Threading;
+using System.Windows.Interop;
 using Path = System.Windows.Shapes.Path;
 
 namespace AspireSense
@@ -49,7 +50,12 @@ namespace AspireSense
             {
                 if (!isDllPresent.HasValue)
                 {
-                    isDllPresent = File.Exists(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "InsydeDCHU.dll"));
+                    string dir1 = AppDomain.CurrentDomain.BaseDirectory;
+                    string dir2 = "";
+                    try { dir2 = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location); } catch { }
+                    isDllPresent = (File.Exists(System.IO.Path.Combine(dir1, "InsydeDCHU.dll")) ||
+                                    (!string.IsNullOrEmpty(dir2) && File.Exists(System.IO.Path.Combine(dir2, "InsydeDCHU.dll"))) ||
+                                    File.Exists("InsydeDCHU.dll"));
                 }
                 return isDllPresent.Value;
             }
@@ -140,8 +146,8 @@ namespace AspireSense
                     int rawGpuRpm = (buf[4] << 8) | buf[5];
                     cpuRpm = (rawCpuRpm > 0 && rawCpuRpm < 9000) ? rawCpuRpm : 0;
                     gpuRpm = (rawGpuRpm > 0 && rawGpuRpm < 9000) ? rawGpuRpm : 0;
-                    cpuDuty = Math.Min(100, (int)buf[16]);
-                    gpuDuty = Math.Min(100, (int)buf[19]);
+                    cpuDuty = Math.Min(100, Math.Max(0, (int)Math.Round((buf[16] / 255.0) * 100)));
+                    gpuDuty = Math.Min(100, Math.Max(0, (int)Math.Round((buf[19] / 255.0) * 100)));
                     int rawCpuTemp = buf[18];
                     int rawGpuTemp = buf[21];
                     cpuTemp = (rawCpuTemp >= 20 && rawCpuTemp <= 115) ? rawCpuTemp : 45;
@@ -840,6 +846,12 @@ namespace AspireSense
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetTemperature")]
         public static extern int nvmlDeviceGetTemperature(IntPtr device, int sensorType, out uint temp);
 
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetPowerUsage")]
+        public static extern int nvmlDeviceGetPowerUsage(IntPtr device, out uint powerMw);
+
+        [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetEnforcedPowerLimit")]
+        public static extern int nvmlDeviceGetEnforcedPowerLimit(IntPtr device, out uint limitMw);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct nvmlMemory_t
         {
@@ -903,6 +915,9 @@ namespace AspireSense
         private static readonly object ecLock = new object();
         private static bool nvmlReady = false;
         private static IntPtr nvmlDevice = IntPtr.Zero;
+        private static uint nvmlPowerLimitMw = 0;
+        private static PerformanceCounter cpuPowerCounter = null;
+        private static bool cpuPowerInitialized = false;
 
         // Hardware Identity & Detection
         public static HardwareVendor DetectedVendor = HardwareVendor.Acer;
@@ -936,6 +951,12 @@ namespace AspireSense
                         if (nvmlDeviceGetName(nvmlDevice, sb, 128) == 0 && sb.Length > 0)
                         {
                             ChassisGpuName = sb.ToString().Trim();
+                        }
+
+                        uint pLim;
+                        if (nvmlDeviceGetEnforcedPowerLimit(nvmlDevice, out pLim) == 0 && pLim > 0)
+                        {
+                            nvmlPowerLimitMw = pLim;
                         }
                     }
                 }
@@ -1350,6 +1371,8 @@ namespace AspireSense
             public int BatteryPercent;
 
             // Advanced Telemetry Metrics
+            public float CpuWatts;
+            public float GpuWatts;
             public double VramTotalGb;
             public double VramUsedGb;
             public double VramFreeGb;
@@ -1369,10 +1392,15 @@ namespace AspireSense
         private static int procTick = 0;
         private static List<Tuple<string, double>> cachedTopProc = new List<Tuple<string, double>>();
 
+        // Cached WMI thermal zone temperature (avoid hitting WMI every second — triggers CompatTelRunner / telemetry)
+        private static int cachedThermalZoneTemp = -1;
+        private static int thermalZoneTick = 0;
+        private const int THERMAL_ZONE_REFRESH_INTERVAL = 5; // Re-query WMI only every 5 seconds
+
         public static List<Tuple<string, double>> GetTopMemoryProcesses()
         {
             procTick++;
-            if (cachedTopProc.Count > 0 && (procTick % 3 != 0))
+            if (cachedTopProc.Count > 0 && (procTick % 10 != 0))
             {
                 return cachedTopProc;
             }
@@ -1419,6 +1447,13 @@ namespace AspireSense
 
         private static int GetThermalZoneTemperature()
         {
+            // Use cached value if available and not stale (avoids WMI overhead every second)
+            thermalZoneTick++;
+            if (cachedThermalZoneTemp > 0 && (thermalZoneTick % THERMAL_ZONE_REFRESH_INTERVAL != 0))
+            {
+                return cachedThermalZoneTemp;
+            }
+
             try
             {
                 using (ManagementObjectSearcher s = new ManagementObjectSearcher(@"root\wmi", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature"))
@@ -1431,14 +1466,18 @@ namespace AspireSense
                             {
                                 double kelvin10 = Convert.ToDouble(obj["CurrentTemperature"]);
                                 int celsius = (int)((kelvin10 / 10.0) - 273.15);
-                                if (celsius >= 20 && celsius <= 115) return celsius;
+                                if (celsius >= 20 && celsius <= 115)
+                                {
+                                    cachedThermalZoneTemp = celsius;
+                                    return celsius;
+                                }
                             }
                         }
                     }
                 }
             }
             catch { }
-            return -1;
+            return (cachedThermalZoneTemp > 0) ? cachedThermalZoneTemp : -1;
         }
 
         public static SensorData ReadSensors(PerformanceCounter cpuCounter)
@@ -1590,6 +1629,35 @@ namespace AspireSense
                     uint pWidth;
                     if (nvmlDeviceGetCurrPcieLinkWidth(nvmlDevice, out pWidth) == 0)
                         data.PcieWidth = pWidth;
+
+                    uint pMw;
+                    if (nvmlDeviceGetPowerUsage(nvmlDevice, out pMw) == 0 && pMw > 0)
+                    {
+                        // Sanity check: On mobile GPUs with Optimus/D3Cold sleep states,
+                        // nvmlDeviceGetPowerUsage returns ~590006 mW (0x900B6) as an ACPI/EC dummy register value when idling or sleeping.
+                        // Maximum possible mobile laptop GPU TGP is ~175W (and on RTX 4050 it is 60W-75W).
+                        uint maxLimit = (nvmlPowerLimitMw > 0) ? (uint)(nvmlPowerLimitMw * 1.35) : 180000;
+                        if (pMw <= maxLimit && pMw < 250000)
+                        {
+                            data.GpuWatts = (float)Math.Round(pMw / 1000.0, 1);
+                        }
+                        else
+                        {
+                            // 590,000+ mW indicates GPU is in deep idle/sleep (Optimus D3Cold)
+                            if (data.GpuUsage <= 1)
+                            {
+                                data.GpuWatts = 0f;
+                            }
+                            else
+                            {
+                                data.GpuWatts = (float)Math.Round(12.0f + (data.GpuUsage * 0.70f), 1);
+                            }
+                        }
+                    }
+                    else if (data.GpuUsage > 0)
+                    {
+                        data.GpuWatts = (float)Math.Round(12.0f + (data.GpuUsage * 0.70f), 1);
+                    }
                 }
                 catch
                 {
@@ -1609,6 +1677,49 @@ namespace AspireSense
                 }
             }
             catch { }
+
+            try
+            {
+                if (!cpuPowerInitialized)
+                {
+                    cpuPowerInitialized = true;
+                    if (PerformanceCounterCategory.Exists("Energy Meter"))
+                    {
+                        PerformanceCounterCategory cat = new PerformanceCounterCategory("Energy Meter");
+                        string[] instances = cat.GetInstanceNames();
+                        string targetInst = null;
+                        foreach (string inst in instances)
+                        {
+                            if (inst.IndexOf("pkg", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                targetInst = inst;
+                                break;
+                            }
+                        }
+                        if (targetInst == null && instances.Length > 0) targetInst = instances[0];
+                        if (targetInst != null)
+                        {
+                            cpuPowerCounter = new PerformanceCounter("Energy Meter", "Power", targetInst);
+                            cpuPowerCounter.NextValue();
+                        }
+                    }
+                }
+
+                if (cpuPowerCounter != null)
+                {
+                    float mw = cpuPowerCounter.NextValue();
+                    if (mw > 0 && mw < 200000)
+                    {
+                        data.CpuWatts = (float)Math.Round(mw / 1000.0, 1);
+                    }
+                }
+            }
+            catch { }
+
+            if (data.CpuWatts <= 0 && data.CpuUsage > 0)
+            {
+                data.CpuWatts = (float)Math.Round(15.0f + (data.CpuUsage * 0.45f), 1);
+            }
 
             try
             {
@@ -1646,320 +1757,611 @@ namespace AspireSense
     }
 
     // ==========================================
-    // SPEEDOMETER GAUGE COMPONENT (BLUE-BLACK DESIGN)
+    // EC ANTI-HALLUCINATION ARBITER ENGINE
     // ==========================================
+    public static class EcAntiHallucinationEngine
+    {
+        public static bool IsEnabled = true;
+        public static int AcousticClampDuty = 35; // Default 35% duty cycle (~2,000-2,200 RPM whisper acoustic floor)
+        public static int SustainedThresholdSeconds = 4; // Default 4 seconds
+        public static int FailsafeTemp = 86; // 86°C emergency override
+        public static bool AutoUnclampGaming = true;
+        public static bool PowerBoostTamed = false;
+
+        // Live Telemetry State
+        public static double RawCpuTemp = 0;
+        public static double FilteredThermalEma = 0;
+        public static double HeatsinkSaturationPct = 0;
+        public static int InterceptedSpikeCount = 0;
+        public static int SustainedLoadDurationSec = 0;
+        public static string CurrentClassifierState = "Awaiting Sensor Data...";
+        public static bool IsCurrentlyClamped = false;
+        public static int CurrentAppliedMode = -1;
+
+        private static List<string> decisionLogs = new List<string>();
+        private static readonly object logLock = new object();
+
+        public static void LogDecision(string entry)
+        {
+            lock (logLock)
+            {
+                string timeStr = DateTime.Now.ToString("HH:mm:ss");
+                decisionLogs.Add(string.Format("[{0}] {1}", timeStr, entry));
+                if (decisionLogs.Count > 60) decisionLogs.RemoveAt(0);
+            }
+        }
+
+        public static List<string> GetRecentLogs(int count)
+        {
+            lock (logLock)
+            {
+                int start = Math.Max(0, decisionLogs.Count - count);
+                return decisionLogs.GetRange(start, decisionLogs.Count - start);
+            }
+        }
+
+        public static void ClearLogs()
+        {
+            lock (logLock)
+            {
+                decisionLogs.Clear();
+                LogDecision("Decision stream cleared by user");
+            }
+        }
+
+        public static void Toggle()
+        {
+            IsEnabled = !IsEnabled;
+            if (!IsEnabled)
+            {
+                IsCurrentlyClamped = false;
+                CurrentAppliedMode = 0;
+                HardwareBridge.ResetToAuto();
+                LogDecision("GUARD DISABLED: Manual toggle -> Restored factory EC Auto Mode");
+            }
+            else
+            {
+                CurrentAppliedMode = -1;
+                LogDecision("GUARD ENABLED: Acoustic arbiter active -> Suppressing transient micro-spikes");
+            }
+        }
+
+        public static void SetClampDuty(int duty)
+        {
+            AcousticClampDuty = Math.Max(25, Math.Min(60, duty));
+            LogDecision(string.Format("CONFIG: Acoustic clamp ceiling set to {0}% duty", AcousticClampDuty));
+        }
+
+        public static void SetHysteresisSeconds(int seconds)
+        {
+            SustainedThresholdSeconds = Math.Max(1, Math.Min(15, seconds));
+            LogDecision(string.Format("CONFIG: Sustained hysteresis delay set to {0} seconds", SustainedThresholdSeconds));
+        }
+
+        public static void SetFailsafeTemp(int temp)
+        {
+            FailsafeTemp = Math.Max(75, Math.Min(95, temp));
+            LogDecision(string.Format("CONFIG: Failsafe emergency temperature set to {0}°C", FailsafeTemp));
+        }
+
+        public static void TogglePowerBoostTamer()
+        {
+            try
+            {
+                PowerBoostTamed = !PowerBoostTamed;
+                int targetState = PowerBoostTamed ? 99 : 100;
+                string argsAc = string.Format("/setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX {0}", targetState);
+                string argsDc = string.Format("/setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX {0}", targetState);
+
+                ProcessStartInfo psi1 = new ProcessStartInfo("powercfg.exe", argsAc) { CreateNoWindow = true, UseShellExecute = false };
+                Process p1 = Process.Start(psi1);
+                if (p1 != null) p1.WaitForExit(1000);
+
+                ProcessStartInfo psi2 = new ProcessStartInfo("powercfg.exe", argsDc) { CreateNoWindow = true, UseShellExecute = false };
+                Process p2 = Process.Start(psi2);
+                if (p2 != null) p2.WaitForExit(1000);
+
+                ProcessStartInfo psiAct = new ProcessStartInfo("powercfg.exe", "/setactive SCHEME_CURRENT") { CreateNoWindow = true, UseShellExecute = false };
+                Process pAct = Process.Start(psiAct);
+                if (pAct != null) pAct.WaitForExit(1000);
+
+                if (PowerBoostTamed)
+                {
+                    LogDecision("POWER TAMER: Maximum processor state set to 99% (Micro-burst overvolt eliminated)");
+                }
+                else
+                {
+                    LogDecision("POWER TAMER: Maximum processor state restored to 100% (Default Windows turbo)");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDecision("POWER TAMER ERROR: " + ex.Message);
+            }
+        }
+
+        public static void CheckCurrentPowerPlanState()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("powercfg.exe", "/query SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX")
+                {
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(1000);
+                        if (output.IndexOf("0x00000063", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            PowerBoostTamed = true;
+                        }
+                        else
+                        {
+                            PowerBoostTamed = false;
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void Update(int cpuTemp, int gpuTemp, float cpuUsage, float gpuUsage, float cpuWatts, bool isGaming)
+        {
+            RawCpuTemp = cpuTemp;
+
+            // 1. Calculate Physical Heatsink Thermal EMA (alpha = 0.15)
+            if (FilteredThermalEma <= 0) FilteredThermalEma = cpuTemp;
+            else FilteredThermalEma = (0.15 * cpuTemp) + (0.85 * FilteredThermalEma);
+
+            // Physical heatsink thermal saturation (40C = 0%, 85C = 100%)
+            HeatsinkSaturationPct = Math.Max(0.0, Math.Min(100.0, ((FilteredThermalEma - 40.0) / 45.0) * 100.0));
+
+            // 2. Track workload sustain duration
+            bool isHeavyLoad = (cpuUsage >= 45.0f || gpuUsage >= 50.0f);
+            if (isHeavyLoad)
+            {
+                SustainedLoadDurationSec++;
+            }
+            else
+            {
+                if (SustainedLoadDurationSec > 0) SustainedLoadDurationSec--;
+            }
+
+            // 3. Classify and Decide
+            if (!IsEnabled)
+            {
+                CurrentClassifierState = "⚪ GUARD DISABLED (RAW EC FIRMWARE CONTROL)";
+                if (CurrentAppliedMode != 0)
+                {
+                    CurrentAppliedMode = 0;
+                    IsCurrentlyClamped = false;
+                    HardwareBridge.ResetToAuto();
+                }
+                return;
+            }
+
+            // Rule 1: Emergency Thermal Failsafe (Safety First)
+            if (cpuTemp >= FailsafeTemp || gpuTemp >= 85)
+            {
+                CurrentClassifierState = string.Format("🚨 EMERGENCY FAILSAFE ({0}°C >= {1}°C) - TURBO ENGAGED", cpuTemp, FailsafeTemp);
+                IsCurrentlyClamped = false;
+                if (CurrentAppliedMode != 1)
+                {
+                    CurrentAppliedMode = 1;
+                    HardwareBridge.SetFanMode(1); // Force Max cooling
+                    LogDecision(string.Format("EMERGENCY FAILSAFE: CPU {0}°C >= {1}°C -> Fans 100% Turbo", cpuTemp, FailsafeTemp));
+                }
+                return;
+            }
+
+            // Rule 2: Active Gaming Unclamp (DirectX ETW)
+            if (isGaming && AutoUnclampGaming)
+            {
+                CurrentClassifierState = "🎮 3D GAMING ACTIVE - FANS UNRESTRICTED";
+                if (CurrentAppliedMode != 0)
+                {
+                    CurrentAppliedMode = 0;
+                    IsCurrentlyClamped = false;
+                    HardwareBridge.ResetToAuto();
+                    LogDecision("GAMING DETECTED via DirectX ETW -> Restored Auto cooling");
+                }
+                return;
+            }
+
+            // Rule 3: Sustained Compute (Legitimate Render / Compile / Heavy Work)
+            if (SustainedLoadDurationSec >= SustainedThresholdSeconds)
+            {
+                CurrentClassifierState = string.Format("🔥 SUSTAINED LOAD ({0}s >= {1}s) - ADAPTIVE COOLING", SustainedLoadDurationSec, SustainedThresholdSeconds);
+                if (CurrentAppliedMode != 0)
+                {
+                    CurrentAppliedMode = 0;
+                    IsCurrentlyClamped = false;
+                    HardwareBridge.ResetToAuto();
+                    LogDecision(string.Format("SUSTAINED LOAD: {0}s sustained load -> Restored Auto cooling", SustainedLoadDurationSec));
+                }
+                return;
+            }
+
+            // Rule 4: Transient Micro-Burst / Desktop Browsing (INTERCEPT & PREVENT JET REV)
+            // Use native Acer EC Silent Mode (Mode 3): Caps fan RPM and enforces quiet acoustics
+            if (cpuTemp >= 65 && cpuUsage < 35.0f && !isHeavyLoad)
+            {
+                InterceptedSpikeCount++;
+                CurrentClassifierState = string.Format("⚡ TRANSIENT SPIKE BLOCKED ({0}°C Die / {1:F0}°C Heatsink) - SILENT MODE", cpuTemp, FilteredThermalEma);
+                if (CurrentAppliedMode != 3)
+                {
+                    CurrentAppliedMode = 3;
+                    IsCurrentlyClamped = true;
+                    HardwareBridge.SetFanMode(3); // Native Hardware Silent Mode (quiet acoustics)
+                    LogDecision(string.Format("SPIKE BLOCKED: {0}°C micro-burst (Load: {1:F0}%) -> Engaged EC Silent Mode (3)", cpuTemp, cpuUsage));
+                }
+            }
+            else
+            {
+                CurrentClassifierState = "🛡️ BROWSING PROTECTED - HARDWARE SILENT MODE (3)";
+                if (CurrentAppliedMode != 3)
+                {
+                    CurrentAppliedMode = 3;
+                    IsCurrentlyClamped = true;
+                    HardwareBridge.SetFanMode(3); // Native Hardware Silent Mode (quiet acoustics)
+                    LogDecision("DESKTOP BROWSING: Engaged EC Silent Mode (3) - Fan revving suppressed");
+                }
+            }
+        }
+    }
+
     // ==========================================
-    // CYBERPUNK SUPERCAR COCKPIT SPEEDOMETER GAUGE
+    // DESIGN TOKENS (APPLE HIG & PRECISION CRAFT)
     // ==========================================
-    public class SpeedometerGauge : Canvas
+    public static class DesignTokens
+    {
+        // Surfaces & Backgrounds
+        public static readonly Color BgWindow = Color.FromRgb(11, 15, 25);            // #0B0F19 - Deep slate window canvas
+        public static readonly Color BgCard = Color.FromRgb(17, 24, 39);              // #111827 - Surface card
+        public static readonly Color BgCardHover = Color.FromRgb(24, 33, 53);         // #182135 - Hover state
+        public static readonly Color BgCardActive = Color.FromRgb(30, 41, 59);        // #1E293B - Selected state
+        public static readonly Color BgInput = Color.FromRgb(15, 23, 42);             // #0F172A - Control / input surface
+        public static readonly Color BorderSubtle = Color.FromRgb(31, 41, 61);        // #1F293D - Clean hairline border
+        public static readonly Color BorderSubtleLight = Color.FromRgb(51, 65, 85);   // #334155 - Card highlight border
+        public static readonly Color BorderFocus = Color.FromRgb(0, 163, 255);        // #00A3FF - Active accent outline
+
+        // Typography (WCAG AA Compliant on dark surfaces)
+        public static readonly Color TextPrimaryColor = Color.FromRgb(248, 250, 252);     // #F8FAFC - Near white
+        public static readonly Color TextSecondaryColor = Color.FromRgb(148, 163, 184);   // #94A3B8 - Slate-400 (>5.5:1 contrast)
+        public static readonly Color TextMutedColor = Color.FromRgb(100, 116, 139);       // #64748B - Slate-500
+
+        public static readonly SolidColorBrush BrushBgWindow = new SolidColorBrush(BgWindow);
+        public static readonly SolidColorBrush BrushBgCard = new SolidColorBrush(BgCard);
+        public static readonly SolidColorBrush BrushBgCardHover = new SolidColorBrush(BgCardHover);
+        public static readonly SolidColorBrush BrushBgCardActive = new SolidColorBrush(BgCardActive);
+        public static readonly SolidColorBrush BrushBgInput = new SolidColorBrush(BgInput);
+        public static readonly SolidColorBrush BrushBorderSubtle = new SolidColorBrush(BorderSubtle);
+        public static readonly SolidColorBrush BrushBorderSubtleLight = new SolidColorBrush(BorderSubtleLight);
+        public static readonly SolidColorBrush BrushBorderFocus = new SolidColorBrush(BorderFocus);
+
+        public static readonly SolidColorBrush BrushTextPrimary = new SolidColorBrush(TextPrimaryColor);
+        public static readonly SolidColorBrush BrushTextSecondary = new SolidColorBrush(TextSecondaryColor);
+        public static readonly SolidColorBrush BrushTextMuted = new SolidColorBrush(TextMutedColor);
+
+        // Semantic Accents
+        public static readonly Color AccentBlue = Color.FromRgb(0, 163, 255);         // #00A3FF - Primary brand / active
+        public static readonly Color AccentCyan = Color.FromRgb(6, 182, 212);         // #06B6D4 - Secondary telemetry
+        public static readonly Color AccentGreen = Color.FromRgb(16, 185, 129);       // #10B981 - Optimal / running
+        public static readonly Color AccentAmber = Color.FromRgb(245, 158, 11);       // #F59E0B - Warning
+        public static readonly Color AccentRed = Color.FromRgb(239, 68, 68);          // #EF4444 - Critical / Redline
+        public static readonly Color AccentPurple = Color.FromRgb(168, 85, 247);      // #A855F7 - Memory
+
+        public static readonly SolidColorBrush BrushAccentBlue = new SolidColorBrush(AccentBlue);
+        public static readonly SolidColorBrush BrushAccentCyan = new SolidColorBrush(AccentCyan);
+        public static readonly SolidColorBrush BrushAccentGreen = new SolidColorBrush(AccentGreen);
+        public static readonly SolidColorBrush BrushAccentAmber = new SolidColorBrush(AccentAmber);
+        public static readonly SolidColorBrush BrushAccentRed = new SolidColorBrush(AccentRed);
+        public static readonly SolidColorBrush BrushAccentPurple = new SolidColorBrush(AccentPurple);
+    }
+
+    // ==========================================
+    // APPLE ACTIVITY-STYLE TELEMETRY RING GAUGE
+    // ==========================================
+    public class SpeedometerGauge : Grid
     {
         private Path bgArc;
         private Path valArc;
-        private Line needle;
-        private TextBlock txtPercent;
-        private TextBlock txtTemp;
-        private TextBlock txtRpm;
         private TextBlock txtHeader;
         private TextBlock txtSub;
-        private SegmentedMeter miniTempBar;
+        private TextBlock txtTemp;
+        private TextBlock txtRpm;
+        private TextBlock txtDutyBadge;
+        private TextBlock txtWatts;
+        private TextBlock txtPercent;
+        private TextBlock txtDutyVal;
 
-        private double radius;
-        private double cx;
-        private double cy;
-        private double startAngle = 225.0; // 7 o'clock (bottom-left)
-        private double sweepAngle = 270.0; // Sweeps clockwise through 12 o'clock to 5 o'clock (bottom-right)
-        private LinearGradientBrush blueGrad;
+        private double radius = 84.0;
+        private double cx = 105.0;
+        private double cy = 105.0;
+        private double startAngle = 225.0; // Bottom-left (7:30)
+        private double sweepAngle = 270.0; // Sweeps clockwise through 12:00 to bottom-right (4:30)
+        private LinearGradientBrush ringGrad;
+        private bool isGpuDevice = false;
 
-        public SpeedometerGauge(string hardwareName, string modelSub, double size)
+        public SpeedometerGauge(string hardwareName, string modelSub, double size, bool isGpu = false)
         {
+            this.isGpuDevice = isGpu;
             this.Width = size;
-            this.Height = size + 35;
-            this.cx = size / 2.0;
-            this.cy = (size / 2.0) - 8;
-            this.radius = (size / 2.0) - 26;
+            this.HorizontalAlignment = HorizontalAlignment.Center;
+            this.VerticalAlignment = VerticalAlignment.Stretch;
 
-            // 1. Outer Halo Ring with Dash Pattern
-            Ellipse outerRing = new Ellipse
+            this.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 0: Chip Header
+            this.RowDefinitions.Add(new RowDefinition { Height = new GridLength(210) }); // 1: Activity Ring
+            this.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 2: 3-Pod Telemetry Strip
+
+            // 1. Hardware Category & Title Header
+            StackPanel headSp = new StackPanel
             {
-                Width = size - 12,
-                Height = size - 12,
-                Stroke = new SolidColorBrush(Color.FromArgb(40, 0, 210, 255)),
-                StrokeThickness = 1,
-                StrokeDashArray = new DoubleCollection(new double[] { 3, 3 })
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 10)
             };
-            Canvas.SetLeft(outerRing, 6);
-            Canvas.SetTop(outerRing, 6);
-            this.Children.Add(outerRing);
 
-            // 2. Background Track Arc (Dark stealth slate)
-            bgArc = new Path
+            Border chipBadge = new Border
             {
-                Stroke = new SolidColorBrush(Color.FromArgb(220, 15, 23, 38)),
-                StrokeThickness = 12,
-                StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round,
-                Data = CreateArcGeometry(cx, cy, radius, startAngle, startAngle + sweepAngle)
-            };
-            this.Children.Add(bgArc);
-
-            // 3. Numbered Radial Speed Ticks & REDLINE Zone (80% - 100%)
-            for (int i = 0; i <= 10; i++)
-            {
-                double angle = startAngle + (i / 10.0) * sweepAngle;
-                double rad = (angle - 90) * Math.PI / 180.0;
-                bool isMajor = (i % 2 == 0);
-                bool isRedline = (i >= 8); // 80%, 90%, 100% are Redline!
-
-                double rIn = radius - (isMajor ? 14 : 9);
-                double rOut = radius + (isMajor ? 10 : 5);
-
-                Line tick = new Line
-                {
-                    X1 = cx + rIn * Math.Cos(rad),
-                    Y1 = cy + rIn * Math.Sin(rad),
-                    X2 = cx + rOut * Math.Cos(rad),
-                    Y2 = cy + rOut * Math.Sin(rad),
-                    Stroke = isRedline ? new SolidColorBrush(Color.FromRgb(255, 30, 86)) : (isMajor ? new SolidColorBrush(Color.FromRgb(0, 225, 255)) : new SolidColorBrush(Color.FromArgb(100, 0, 150, 255))),
-                    StrokeThickness = isRedline ? 2.5 : (isMajor ? 2.0 : 1.0)
-                };
-                this.Children.Add(tick);
-
-                if (isMajor)
-                {
-                    double rNum = radius - 26;
-                    double nx = cx + rNum * Math.Cos(rad) - 8;
-                    double ny = cy + rNum * Math.Sin(rad) - 6;
-
-                    TextBlock numTb = new TextBlock
-                    {
-                        Text = (i * 10).ToString(),
-                        FontSize = 8.5,
-                        FontWeight = FontWeights.Bold,
-                        Foreground = isRedline ? new SolidColorBrush(Color.FromRgb(255, 60, 90)) : new SolidColorBrush(Color.FromRgb(130, 170, 215))
-                    };
-                    Canvas.SetLeft(numTb, nx);
-                    Canvas.SetTop(numTb, ny);
-                    this.Children.Add(numTb);
-                }
-            }
-
-            // Redline Badge near 95% mark
-            TextBlock redlineBadge = new TextBlock
-            {
-                Text = "REDLINE",
-                FontSize = 7,
-                FontWeight = FontWeights.Black,
-                Foreground = new SolidColorBrush(Color.FromRgb(255, 40, 80))
-            };
-            Canvas.SetLeft(redlineBadge, cx + 55);
-            Canvas.SetTop(redlineBadge, cy + 50);
-            this.Children.Add(redlineBadge);
-
-            // 4. Foreground Active Value Arc
-            blueGrad = new LinearGradientBrush
-            {
-                StartPoint = new Point(0, 1),
-                EndPoint = new Point(1, 0)
-            };
-            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 140, 255), 0.0));
-            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(0, 225, 255), 0.7));
-            blueGrad.GradientStops.Add(new GradientStop(Color.FromRgb(56, 189, 248), 1.0));
-
-            valArc = new Path
-            {
-                Stroke = blueGrad,
-                StrokeThickness = 12,
-                StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round,
-                Effect = new DropShadowEffect
-                {
-                    Color = Color.FromRgb(0, 210, 255),
-                    BlurRadius = 18,
-                    ShadowDepth = 0,
-                    Opacity = 0.85
-                }
-            };
-            this.Children.Add(valArc);
-
-            // 5. Laser Needle
-            needle = new Line
-            {
-                X1 = cx,
-                Y1 = cy,
-                X2 = cx - (radius - 14) * 0.707,
-                Y2 = cy + (radius - 14) * 0.707,
-                Stroke = new LinearGradientBrush(Color.FromRgb(255, 255, 255), Color.FromRgb(0, 225, 255), 90),
-                StrokeThickness = 3.2,
-                StrokeEndLineCap = PenLineCap.Round,
-                Effect = new DropShadowEffect
-                {
-                    Color = Color.FromRgb(0, 210, 255),
-                    BlurRadius = 12,
-                    ShadowDepth = 0,
-                    Opacity = 0.95
-                }
-            };
-            this.Children.Add(needle);
-
-            // 6. Center Turbine Pivot Hub
-            Ellipse pivot = new Ellipse
-            {
-                Width = 20,
-                Height = 20,
-                Fill = new RadialGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(10, 18, 35)),
-                Stroke = new SolidColorBrush(Color.FromRgb(0, 225, 255)),
-                StrokeThickness = 2
-            };
-            Canvas.SetLeft(pivot, cx - 10);
-            Canvas.SetTop(pivot, cy - 10);
-            this.Children.Add(pivot);
-
-            // 7. Center Digital Speedometer Readout
-            txtPercent = new TextBlock
-            {
-                Text = "0%",
-                FontSize = 36,
-                FontWeight = FontWeights.Black,
-                Foreground = Brushes.White,
-                TextAlignment = TextAlignment.Center,
-                Width = size
-            };
-            Canvas.SetTop(txtPercent, cy - 62);
-            this.Children.Add(txtPercent);
-
-            TextBlock lblUsageSub = new TextBlock
-            {
-                Text = "LOAD / DUTY",
-                FontSize = 8.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(90, 140, 190)),
-                TextAlignment = TextAlignment.Center,
-                Width = size
-            };
-            Canvas.SetTop(lblUsageSub, cy - 24);
-            this.Children.Add(lblUsageSub);
-
-            // 8. Coolant Temperature Sub-Gauge in the Bottom Opening
-            Border tempBadge = new Border
-            {
-                Background = new SolidColorBrush(Color.FromArgb(190, 11, 17, 30)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 0, 180, 240)),
+                CornerRadius = new CornerRadius(5),
+                Background = isGpu ? new SolidColorBrush(Color.FromArgb(40, 16, 185, 129)) : new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)),
+                BorderBrush = isGpu ? DesignTokens.BrushAccentGreen : DesignTokens.BrushAccentCyan,
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(10, 4, 10, 4),
-                HorizontalAlignment = HorizontalAlignment.Center
+                Padding = new Thickness(8, 2, 8, 2),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 4)
             };
-            StackPanel tSp = new StackPanel();
-            txtTemp = new TextBlock
+            TextBlock chipTxt = new TextBlock
             {
-                Text = "🌡️ -- °C",
-                FontSize = 11.5,
+                Text = isGpu ? "⚡ GRAPHICS SILICON" : "🔲 PROCESSOR PACKAGE",
+                FontSize = 9.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255)),
-                HorizontalAlignment = HorizontalAlignment.Center
+                Foreground = isGpu ? DesignTokens.BrushAccentGreen : DesignTokens.BrushAccentCyan
             };
-            tSp.Children.Add(txtTemp);
-
-            miniTempBar = new SegmentedMeter(5, Color.FromRgb(0, 255, 140), 10, 3);
-            miniTempBar.Margin = new Thickness(0, 3, 0, 0);
-            miniTempBar.HorizontalAlignment = HorizontalAlignment.Center;
-            tSp.Children.Add(miniTempBar);
-
-            tempBadge.Child = tSp;
-            Canvas.SetLeft(tempBadge, cx - 42);
-            Canvas.SetTop(tempBadge, cy + 20);
-            this.Children.Add(tempBadge);
-
-            // 9. Lower Fan RPM & Titles
-            txtRpm = new TextBlock
-            {
-                Text = "❄️ -- RPM (0%)",
-                FontSize = 11,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
-                TextAlignment = TextAlignment.Center,
-                Width = size
-            };
-            Canvas.SetTop(txtRpm, cy + 62);
-            this.Children.Add(txtRpm);
+            chipBadge.Child = chipTxt;
+            headSp.Children.Add(chipBadge);
 
             txtHeader = new TextBlock
             {
                 Text = hardwareName,
-                FontSize = 12,
-                FontWeight = FontWeights.Black,
-                Foreground = Brushes.White,
+                FontSize = 14,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
                 TextAlignment = TextAlignment.Center,
-                Width = size
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxWidth = 310
             };
-            Canvas.SetTop(txtHeader, size + 4);
-            this.Children.Add(txtHeader);
+            headSp.Children.Add(txtHeader);
 
             txtSub = new TextBlock
             {
                 Text = modelSub,
-                FontSize = 9.5,
-                Foreground = new SolidColorBrush(Color.FromRgb(110, 150, 190)),
+                FontSize = 10.5,
+                Foreground = DesignTokens.BrushTextSecondary,
                 TextAlignment = TextAlignment.Center,
-                Width = size
+                Margin = new Thickness(0, 2, 0, 0)
             };
-            Canvas.SetTop(txtSub, size + 20);
-            this.Children.Add(txtSub);
+            headSp.Children.Add(txtSub);
 
-            Update(0, 40, 0, 0);
+            Grid.SetRow(headSp, 0);
+            this.Children.Add(headSp);
+
+            // 2. The Apple Activity Ring Canvas Container
+            Grid ringHost = new Grid
+            {
+                Width = 210,
+                Height = 210,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            Canvas arcCanvas = new Canvas { Width = 210, Height = 210 };
+
+            // Background Track
+            bgArc = new Path
+            {
+                Stroke = new SolidColorBrush(Color.FromRgb(22, 31, 48)),
+                StrokeThickness = 14,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                Data = CreateArcGeometry(cx, cy, radius, startAngle, startAngle + sweepAngle)
+            };
+            arcCanvas.Children.Add(bgArc);
+
+            // Active Progress Gradient Arc
+            ringGrad = new LinearGradientBrush
+            {
+                StartPoint = new Point(0, 1),
+                EndPoint = new Point(1, 0)
+            };
+            if (isGpu)
+            {
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(16, 185, 129), 0.0));
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(6, 182, 212), 0.7));
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(59, 130, 246), 1.0));
+            }
+            else
+            {
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(6, 182, 212), 0.0));
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(59, 130, 246), 0.7));
+                ringGrad.GradientStops.Add(new GradientStop(Color.FromRgb(147, 51, 234), 1.0));
+            }
+
+            valArc = new Path
+            {
+                Stroke = ringGrad,
+                StrokeThickness = 14,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                Effect = new DropShadowEffect
+                {
+                    Color = isGpu ? Color.FromRgb(16, 185, 129) : Color.FromRgb(6, 182, 212),
+                    BlurRadius = 14,
+                    ShadowDepth = 0,
+                    Opacity = 0.45
+                }
+            };
+            arcCanvas.Children.Add(valArc);
+            ringHost.Children.Add(arcCanvas);
+
+            // Centered Hero Metric Stack (Inside the Ring)
+            StackPanel ringCenterSp = new StackPanel
+            {
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+
+            txtTemp = new TextBlock
+            {
+                Text = "-- °C",
+                FontSize = 38,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
+                TextAlignment = TextAlignment.Center
+            };
+            ringCenterSp.Children.Add(txtTemp);
+
+            txtRpm = new TextBlock
+            {
+                Text = "-- RPM",
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = isGpu ? DesignTokens.BrushAccentGreen : DesignTokens.BrushAccentCyan,
+                TextAlignment = TextAlignment.Center,
+                Margin = new Thickness(0, 1, 0, 0)
+            };
+            ringCenterSp.Children.Add(txtRpm);
+
+            Border dutyPill = new Border
+            {
+                CornerRadius = new CornerRadius(10),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 2, 8, 2),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+            txtDutyBadge = new TextBlock
+            {
+                Text = "● 0% Duty • Idle",
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary
+            };
+            dutyPill.Child = txtDutyBadge;
+            ringCenterSp.Children.Add(dutyPill);
+
+            ringHost.Children.Add(ringCenterSp);
+
+            Grid.SetRow(ringHost, 1);
+            this.Children.Add(ringHost);
+
+            // 3. Bottom 3-Pod Micro Telemetry Strip (POWER | LOAD | FAN DUTY)
+            UniformGrid podGrid = new UniformGrid
+            {
+                Columns = 3,
+                Rows = 1,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+
+            Border podPower = CreateTelemetryPod("POWER", out txtWatts, "-- W", DesignTokens.BrushTextPrimary);
+            Border podLoad = CreateTelemetryPod("LOAD", out txtPercent, "-- %", isGpu ? DesignTokens.BrushAccentGreen : DesignTokens.BrushAccentCyan);
+            Border podDuty = CreateTelemetryPod("FAN DUTY", out txtDutyVal, "-- %", DesignTokens.BrushAccentBlue);
+
+            podGrid.Children.Add(podPower);
+            podGrid.Children.Add(podLoad);
+            podGrid.Children.Add(podDuty);
+
+            Grid.SetRow(podGrid, 2);
+            this.Children.Add(podGrid);
+
+            Update(0, 40, 0, 0, 0);
+        }
+
+        private Border CreateTelemetryPod(string caption, out TextBlock valTb, string initialVal, Brush valBrush)
+        {
+            Border b = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(6, 6, 6, 6),
+                Margin = new Thickness(3, 0, 3, 0)
+            };
+
+            StackPanel sp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
+            TextBlock capTb = new TextBlock
+            {
+                Text = caption,
+                FontSize = 9.0,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextMuted,
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            sp.Children.Add(capTb);
+
+            valTb = new TextBlock
+            {
+                Text = initialVal,
+                FontSize = 12.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = valBrush,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            sp.Children.Add(valTb);
+
+            b.Child = sp;
+            return b;
         }
 
         public void Update(float usage, int temp, int rpm, int duty)
         {
+            Update(usage, temp, rpm, duty, 0);
+        }
+
+        public void Update(float usage, int temp, int rpm, int duty, float watts)
+        {
+            txtTemp.Text = string.Format("{0}°C", temp);
+            txtRpm.Text = (rpm > 0) ? string.Format("{0:N0} RPM", rpm) : "Passive Idle";
             txtPercent.Text = string.Format("{0:F0}%", usage);
-            txtTemp.Text = string.Format("🌡️ {0} °C", temp);
-            txtRpm.Text = (rpm > 0) ? string.Format("❄️ {0} RPM ({1}%)", rpm, duty) : "❄️ 0 RPM (PASSIVE IDLE)";
+            txtDutyVal.Text = string.Format("{0}%", duty);
+            txtWatts.Text = (watts > 0) ? string.Format("{0:F0}W", watts) : "-- W";
+
+            string status = (temp >= 85) ? "Redline" : ((temp >= 72) ? "Warm" : "Optimal");
+            txtDutyBadge.Text = string.Format("● {0}% Duty • {1}", duty, status);
 
             if (temp >= 85)
             {
-                txtTemp.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 60));
+                txtTemp.Foreground = DesignTokens.BrushAccentRed;
+                txtDutyBadge.Foreground = DesignTokens.BrushAccentRed;
+                valArc.Stroke = DesignTokens.BrushAccentRed;
             }
             else if (temp >= 72)
             {
-                txtTemp.Foreground = new SolidColorBrush(Color.FromRgb(255, 170, 0));
+                txtTemp.Foreground = DesignTokens.BrushAccentAmber;
+                txtDutyBadge.Foreground = DesignTokens.BrushAccentAmber;
+                valArc.Stroke = DesignTokens.BrushAccentAmber;
             }
             else
             {
-                txtTemp.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255));
+                txtTemp.Foreground = DesignTokens.BrushTextPrimary;
+                txtDutyBadge.Foreground = isGpuDevice ? DesignTokens.BrushAccentGreen : DesignTokens.BrushAccentCyan;
+                valArc.Stroke = ringGrad;
             }
 
-            if (miniTempBar != null)
-            {
-                double tPct = Math.Max(0.0, Math.Min(100.0, ((temp - 35) / 60.0) * 100.0));
-                miniTempBar.SetValue(tPct);
-                if (temp >= 85) miniTempBar.SetColor(Color.FromRgb(255, 40, 80));
-                else if (temp >= 72) miniTempBar.SetColor(Color.FromRgb(255, 170, 0));
-                else miniTempBar.SetColor(Color.FromRgb(0, 255, 140));
-            }
-
-            double ratio = Math.Max(0.005, Math.Min(1.0, usage / 100.0));
+            // Ring progress mapped to temperature (0..100°C) with minimum visible cap
+            double ratio = Math.Max(0.015, Math.Min(1.0, temp / 100.0));
             double targetAngle = startAngle + (sweepAngle * ratio);
             valArc.Data = CreateArcGeometry(cx, cy, radius, startAngle, targetAngle);
-
-            if (usage >= 85)
-            {
-                valArc.Stroke = new SolidColorBrush(Color.FromRgb(255, 30, 86));
-                needle.Stroke = new SolidColorBrush(Color.FromRgb(255, 50, 90));
-            }
-            else if (usage >= 70)
-            {
-                valArc.Stroke = new SolidColorBrush(Color.FromRgb(255, 170, 0));
-                needle.Stroke = new SolidColorBrush(Color.FromRgb(255, 200, 50));
-            }
-            else
-            {
-                valArc.Stroke = blueGrad;
-                needle.Stroke = new LinearGradientBrush(Color.FromRgb(255, 255, 255), Color.FromRgb(0, 225, 255), 90);
-            }
-
-            double needleRad = (targetAngle - 90) * Math.PI / 180.0;
-            needle.X2 = cx + (radius - 12) * Math.Cos(needleRad);
-            needle.Y2 = cy + (radius - 12) * Math.Sin(needleRad);
         }
 
         private static PathGeometry CreateArcGeometry(double cx, double cy, double r, double sAngle, double eAngle)
@@ -1982,13 +2384,13 @@ namespace AspireSense
     }
 
     // ==========================================
-    // MINIMALIST SEGMENTED METER (HIGH-TECH LED DESIGN)
+    // SEGMENTED LED BAR METER
     // ==========================================
     public class SegmentedMeter : StackPanel
     {
         private List<Border> segments = new List<Border>();
         private Color activeColor;
-        private Color inactiveColor = Color.FromArgb(255, 18, 25, 38);
+        private Color inactiveColor = Color.FromArgb(255, 24, 33, 53);
 
         public SegmentedMeter(int count, Color active, double segWidth, double segHeight)
         {
@@ -2028,6 +2430,1020 @@ namespace AspireSense
     }
 
     // ==========================================
+    // IN-GAME METRICS & OVERLAY ENUMS
+    // ==========================================
+    public enum OverlayPosition
+    {
+        TopLeft,
+        TopRight,
+        CenterTop,
+        BottomLeft,
+        BottomRight
+    }
+
+    public enum OverlayStyle
+    {
+        HorizontalBar,
+        CompactMatrix
+    }
+
+    // ==========================================
+    // ==========================================
+    // ZERO-HOOK DIRECTX / D3D REAL-TIME TELEMETRY ENGINE
+    // ==========================================
+    public static class GameTelemetryEngine
+    {
+        [StructLayout(LayoutKind.Explicit)]
+        public struct WNODE_HEADER
+        {
+            [FieldOffset(0)] public uint BufferSize;
+            [FieldOffset(4)] public uint ProviderId;
+            [FieldOffset(8)] public ulong HistoricalContext;
+            [FieldOffset(16)] public long TimeStamp;
+            [FieldOffset(24)] public Guid Guid;
+            [FieldOffset(40)] public uint ClientContext;
+            [FieldOffset(44)] public uint Flags;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct EVENT_TRACE_PROPERTIES
+        {
+            public WNODE_HEADER Wnode;
+            public uint BufferSize;
+            public uint MinimumBuffers;
+            public uint MaximumBuffers;
+            public uint MaximumFileSize;
+            public uint LogFileMode;
+            public uint FlushTimer;
+            public uint EnableFlags;
+            public int AgeLimit;
+            public uint NumberOfBuffers;
+            public uint FreeBuffers;
+            public uint EventsLost;
+            public uint BuffersWritten;
+            public uint LogBuffersLost;
+            public uint RealTimeBuffersLost;
+            public IntPtr LoggerThreadId;
+            public uint LogFileNameOffset;
+            public uint LoggerNameOffset;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EVENT_TRACE_LOGFILEW
+        {
+            public IntPtr LogFileName;
+            public IntPtr LoggerName;
+            public long CurrentTime;
+            public uint BuffersRead;
+            public uint ProcessTraceMode;
+            public EVENT_TRACE CurrentEvent;
+            public TRACE_LOGFILE_HEADER LogfileHeader;
+            public IntPtr BufferCallback;
+            public uint BufferSize;
+            public uint Filled;
+            public uint EventsLost;
+            public IntPtr EventRecordCallback;
+            public uint IsKernelTrace;
+            public IntPtr Context;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EVENT_TRACE
+        {
+            public EVENT_INSTANCE_HEADER Header;
+            public uint InstanceId;
+            public uint ParentInstanceId;
+            public Guid ParentGuid;
+            public IntPtr MofData;
+            public uint MofLength;
+            public uint ClientContext;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EVENT_INSTANCE_HEADER
+        {
+            public ushort Size;
+            public ushort FieldTypeFlags;
+            public uint Anonymous1;
+            public uint ThreadId;
+            public uint ProcessId;
+            public long TimeStamp;
+            public Guid Guid;
+            public IntPtr ClientContext;
+            public uint EventSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct TRACE_LOGFILE_HEADER
+        {
+            public uint BufferSize;
+            public uint Version;
+            public uint ProviderVersion;
+            public uint NumberOfProcessors;
+            public long EndTime;
+            public uint TimerResolution;
+            public uint MaximumFileSize;
+            public uint LogFileMode;
+            public uint BuffersWritten;
+            public uint StartBuffers;
+            public uint Reserved;
+            public IntPtr LoggerName;
+            public IntPtr LogFileName;
+            public TIME_ZONE_INFORMATION TimeZone;
+            public long BootTime;
+            public long PerfFreq;
+            public long StartTime;
+            public uint ReservedFlags;
+            public uint BuffersLost;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct TIME_ZONE_INFORMATION
+        {
+            public int Bias;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string StandardName;
+            public SYSTEMTIME StandardDate;
+            public int StandardBias;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DaylightName;
+            public SYSTEMTIME DaylightDate;
+            public int DaylightBias;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SYSTEMTIME
+        {
+            public ushort Year;
+            public ushort Month;
+            public ushort DayOfWeek;
+            public ushort Day;
+            public ushort Hour;
+            public ushort Minute;
+            public ushort Second;
+            public ushort Milliseconds;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EVENT_RECORD
+        {
+            public EVENT_HEADER EventHeader;
+            public ETW_BUFFER_CONTEXT BufferContext;
+            public ushort ExtendedDataCount;
+            public ushort UserDataLength;
+            public IntPtr ExtendedData;
+            public IntPtr UserData;
+            public IntPtr UserContext;
+        }
+
+        [StructLayout(LayoutKind.Explicit, Size = 80)]
+        public struct EVENT_HEADER
+        {
+            [FieldOffset(0x00)] public ushort Size;
+            [FieldOffset(0x02)] public ushort HeaderType;
+            [FieldOffset(0x04)] public ushort Flags;
+            [FieldOffset(0x06)] public ushort EventProperty;
+            [FieldOffset(0x08)] public uint ThreadId;
+            [FieldOffset(0x0C)] public uint ProcessId;
+            [FieldOffset(0x10)] public long TimeStamp;
+            [FieldOffset(0x18)] public Guid ProviderId;
+            [FieldOffset(0x28)] public ushort EventId;
+            [FieldOffset(0x2A)] public byte Version;
+            [FieldOffset(0x2B)] public byte Channel;
+            [FieldOffset(0x2C)] public byte Level;
+            [FieldOffset(0x2D)] public byte Opcode;
+            [FieldOffset(0x2E)] public ushort Task;
+            [FieldOffset(0x30)] public ulong Keyword;
+            [FieldOffset(0x38)] public uint KernelTime;
+            [FieldOffset(0x3C)] public uint UserTime;
+            [FieldOffset(0x38)] public ulong ProcessorTime;
+            [FieldOffset(0x40)] public Guid ActivityId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ETW_BUFFER_CONTEXT
+        {
+            public byte ProcessorNumber;
+            public byte Alignment;
+            public ushort LoggerId;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        public delegate void EventRecordCallback([In] ref EVENT_RECORD EventRecord);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern uint StartTrace(out ulong TraceHandle, string InstanceName, IntPtr Properties);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern uint ControlTrace(ulong TraceHandle, string InstanceName, IntPtr Properties, uint ControlCode);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern uint EnableTraceEx2(
+            ulong TraceHandle,
+            ref Guid ProviderId,
+            uint ControlCode,
+            byte Level,
+            ulong MatchAnyKeyword,
+            ulong MatchAllKeyword,
+            uint Timeout,
+            IntPtr EnableParameters
+        );
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr OpenTraceW(IntPtr Logfile);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern uint ProcessTrace(IntPtr[] HandleArray, uint HandleCount, IntPtr StartTime, IntPtr EndTime);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern uint CloseTrace(IntPtr TraceHandle);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint EVENT_TRACE_REAL_TIME_MODE = 0x00000100;
+        private const uint EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1;
+        private const uint EVENT_CONTROL_CODE_STOP_TRACE = 1;
+        private const uint EVENT_TRACE_CONTROL_FLUSH = 3;
+        private const uint PROCESS_TRACE_MODE_REAL_TIME = 0x00000100;
+        private const uint PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000;
+
+        private const string SessionName = "AspireSenseEtwSession";
+        private static readonly Guid DxgiProviderGuid = new Guid("CA11C036-0102-4A2D-A6AD-F03CFED5D3C9");
+        private static readonly Guid D3D9ProviderGuid = new Guid("783ACA0A-790E-4D7F-8451-AA850511C6B9");
+
+        public static double CurrentFps = 0.0;
+        public static double AvgFps = 0.0;
+        public static double OnePercentLowFps = 0.0;
+        public static double CurrentFrameTimeMs = 0.0;
+        public static string ActiveProcessName = "Desktop Window Manager";
+        public static uint ActiveProcessId = 0;
+        public static bool IsEtwActive = false;
+
+        private static volatile uint targetGamePid = 0;
+        private static ulong sessionHandle = 0;
+        private static IntPtr consumerHandle = IntPtr.Zero;
+        private static IntPtr pProperties = IntPtr.Zero;
+        private static IntPtr pLogFile = IntPtr.Zero;
+        private static IntPtr pLoggerName = IntPtr.Zero;
+        private static EventRecordCallback callbackDelegate;
+        private static Thread traceThread;
+        private static bool isRunning = false;
+
+        private static readonly object frameLock = new object();
+        private static readonly Queue<long> frameTimestamps = new Queue<long>();
+        private static readonly List<double> recentFrameTimes = new List<double>();
+        private static readonly Queue<double> rollingFpsHistory = new Queue<double>();
+        private static long lastFrameTimestamp = 0;
+        private static long lastFrameWallClock = 0;
+        private static bool wasInLoadingScreen = false;
+        private static int selfPid = 0;
+
+        public static void Start()
+        {
+            if (isRunning) return;
+            isRunning = true;
+            try
+            {
+                selfPid = Process.GetCurrentProcess().Id;
+            }
+            catch { }
+
+            traceThread = new Thread(RunEtwTrace);
+            traceThread.IsBackground = true;
+            traceThread.Name = "AspireSense-ETW";
+            traceThread.Start();
+        }
+
+        private static void RunEtwTrace()
+        {
+            try
+            {
+                int propSize = Marshal.SizeOf(typeof(EVENT_TRACE_PROPERTIES));
+                int nameBytes = (SessionName.Length + 1) * 2;
+                int allocSize = propSize + nameBytes + 256;
+                pProperties = Marshal.AllocHGlobal(allocSize);
+
+                for (int i = 0; i < allocSize; i++) Marshal.WriteByte(pProperties, i, 0);
+
+                EVENT_TRACE_PROPERTIES props = new EVENT_TRACE_PROPERTIES();
+                props.Wnode.BufferSize = (uint)allocSize;
+                props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
+                props.Wnode.ClientContext = 1;  // QPC
+                props.Wnode.Guid = Guid.NewGuid();
+                props.BufferSize = 64;
+                props.MinimumBuffers = 2;
+                props.MaximumBuffers = 8;
+                props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+                props.LoggerNameOffset = (uint)propSize;
+
+                Marshal.StructureToPtr(props, pProperties, false);
+                pLoggerName = Marshal.StringToHGlobalUni(SessionName);
+                Marshal.Copy(SessionName.ToCharArray(), 0, IntPtr.Add(pProperties, propSize), SessionName.Length);
+
+                // Stop any leftover session first
+                ControlTrace(0, SessionName, pProperties, EVENT_CONTROL_CODE_STOP_TRACE);
+
+                uint status = StartTrace(out sessionHandle, SessionName, pProperties);
+                if (status != 0)
+                {
+                    ControlTrace(0, SessionName, pProperties, EVENT_CONTROL_CODE_STOP_TRACE);
+                    Thread.Sleep(50);
+                    status = StartTrace(out sessionHandle, SessionName, pProperties);
+                }
+
+                if (status == 0 && sessionHandle != 0)
+                {
+                    IsEtwActive = true;
+
+                    // Enable DXGI provider (Informational level, Present events)
+                    Guid dxgi = DxgiProviderGuid;
+                    EnableTraceEx2(sessionHandle, ref dxgi, EVENT_CONTROL_CODE_ENABLE_PROVIDER, 4, 0xFFFFFFFFFFFFFFFF, 0, 0, IntPtr.Zero);
+
+                    // Enable D3D9 provider (Informational level, Present events)
+                    Guid d3d9 = D3D9ProviderGuid;
+                    EnableTraceEx2(sessionHandle, ref d3d9, EVENT_CONTROL_CODE_ENABLE_PROVIDER, 4, 0xFFFFFFFFFFFFFFFF, 0, 0, IntPtr.Zero);
+
+                    // Allocate unmanaged memory for EVENT_TRACE_LOGFILEW so it persists during ProcessTrace
+                    int logFileSize = Marshal.SizeOf(typeof(EVENT_TRACE_LOGFILEW));
+                    pLogFile = Marshal.AllocHGlobal(logFileSize);
+                    for (int i = 0; i < logFileSize; i++) Marshal.WriteByte(pLogFile, i, 0);
+
+                    EVENT_TRACE_LOGFILEW logFile = new EVENT_TRACE_LOGFILEW();
+                    logFile.LoggerName = pLoggerName;
+                    logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+
+                    callbackDelegate = new EventRecordCallback(OnEventRecord);
+                    logFile.EventRecordCallback = Marshal.GetFunctionPointerForDelegate(callbackDelegate);
+
+                    Marshal.StructureToPtr(logFile, pLogFile, false);
+
+                    consumerHandle = OpenTraceW(pLogFile);
+                    if (consumerHandle != IntPtr.Zero && consumerHandle != (IntPtr)(-1))
+                    {
+                        IntPtr[] handles = new IntPtr[] { consumerHandle };
+                        ProcessTrace(handles, 1, IntPtr.Zero, IntPtr.Zero);
+                    }
+                }
+                else
+                {
+                    IsEtwActive = false;
+                }
+            }
+            catch
+            {
+                IsEtwActive = false;
+            }
+        }
+
+        private static void OnEventRecord([In] ref EVENT_RECORD record)
+        {
+            try
+            {
+                uint pid = record.EventHeader.ProcessId;
+                if (pid == 0 || pid == (uint)selfPid) return;
+
+                ushort evId = record.EventHeader.EventId;
+                Guid prov = record.EventHeader.ProviderId;
+
+                bool isPresent = false;
+                if (prov == DxgiProviderGuid)
+                {
+                    // ONLY listen to Present completion (Stop) events:
+                    // 42 = DXGI Present_Stop
+                    // 40 = PresentMultiplaneOverlay_Stop
+                    // 44 = DXGITokenPresent_Stop
+                    if (evId == 42 || evId == 40 || evId == 44)
+                    {
+                        isPresent = true;
+                    }
+                }
+                else if (prov == D3D9ProviderGuid)
+                {
+                    // 2 = D3D9 Present_Stop
+                    if (evId == 2)
+                    {
+                        isPresent = true;
+                    }
+                }
+
+                if (isPresent)
+                {
+                    uint targetPid = targetGamePid;
+                    if (targetPid == 0)
+                    {
+                        string autoName = GetProcessNameSafe((int)pid);
+                        if (!IsSystemProcess(autoName))
+                        {
+                            targetGamePid = pid;
+                            ActiveProcessId = pid;
+                            ActiveProcessName = autoName;
+                            targetPid = pid;
+                        }
+                    }
+
+                    if (targetPid != 0 && pid == targetPid)
+                    {
+                        long qpcTime = record.EventHeader.TimeStamp;
+                        if (qpcTime <= 0)
+                        {
+                            qpcTime = Stopwatch.GetTimestamp();
+                        }
+
+                        lock (frameLock)
+                        {
+                            if (lastFrameTimestamp > 0)
+                            {
+                                long deltaTicks = qpcTime - lastFrameTimestamp;
+                                double deltaMs = deltaTicks * 1000.0 / Stopwatch.Frequency;
+
+                                // Deduplicate duplicate events for same frame within 0.5ms (e.g. swapchain + MPO overlay)
+                                if (deltaMs >= 0.0 && deltaMs < 0.5)
+                                {
+                                    return;
+                                }
+                                if (deltaMs < 0.0 && deltaMs > -0.5)
+                                {
+                                    return;
+                                }
+
+                                if (deltaMs >= 0.5 && deltaMs <= 200.0)
+                                {
+                                    recentFrameTimes.Add(deltaMs);
+                                    if (recentFrameTimes.Count > 500)
+                                    {
+                                        recentFrameTimes.RemoveAt(0);
+                                    }
+                                }
+                            }
+
+                            lastFrameTimestamp = qpcTime;
+                            lastFrameWallClock = Stopwatch.GetTimestamp();
+                            frameTimestamps.Enqueue(qpcTime);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static string GetProcessNameSafe(int pid)
+        {
+            try
+            {
+                IntPtr hProc = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, (uint)pid);
+                if (hProc != IntPtr.Zero)
+                {
+                    try
+                    {
+                        StringBuilder sb = new StringBuilder(1024);
+                        int size = sb.Capacity;
+                        if (QueryFullProcessImageName(hProc, 0, sb, ref size))
+                        {
+                            return System.IO.Path.GetFileName(sb.ToString());
+                        }
+                    }
+                    finally
+                    {
+                        CloseHandle(hProc);
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                {
+                    return p.ProcessName + ".exe";
+                }
+            }
+            catch { }
+
+            return "Application (" + pid + ")";
+        }
+
+        private static bool IsSystemProcess(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            string low = name.ToLowerInvariant();
+            return low.Contains("explorer") ||
+                   low.Contains("taskmgr") ||
+                   low.Contains("aspiresense") ||
+                   low.Contains("firefox") ||
+                   low.Contains("chrome") ||
+                   low.Contains("msedge") ||
+                   low.Contains("brave") ||
+                   low.Contains("opera") ||
+                   low.Contains("compattel") ||
+                   low.Contains("wmiprvse") ||
+                   low.Contains("devenv") ||
+                   low.Contains("cmd.exe") ||
+                   low.Contains("powershell") ||
+                   low.Contains("conhost") ||
+                   low.Contains("searchhost") ||
+                   low.Contains("textinputhost") ||
+                   low.Contains("shellexperiencehost") ||
+                   low.Contains("startmenuexperiencehost") ||
+                   low.Contains("applicationframehost") ||
+                   low.Contains("lockapp") ||
+                   low.Contains("dwm.exe");
+        }
+
+        public static void UpdateMetrics()
+        {
+            try
+            {
+                IntPtr fgHwnd = GetForegroundWindow();
+                if (fgHwnd != IntPtr.Zero)
+                {
+                    uint pid;
+                    GetWindowThreadProcessId(fgHwnd, out pid);
+                    if (pid != 0 && pid != (uint)selfPid)
+                    {
+                        string pName = GetProcessNameSafe((int)pid);
+                        if (!IsSystemProcess(pName))
+                        {
+                            if (targetGamePid != pid)
+                            {
+                                lock (frameLock)
+                                {
+                                    frameTimestamps.Clear();
+                                    recentFrameTimes.Clear();
+                                    rollingFpsHistory.Clear();
+                                    lastFrameTimestamp = 0;
+                                    lastFrameWallClock = 0;
+                                    wasInLoadingScreen = false;
+                                }
+                            }
+                            targetGamePid = pid;
+                            ActiveProcessId = pid;
+                            ActiveProcessName = pName;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            long now = Stopwatch.GetTimestamp();
+            long timeoutLimit = (long)(Stopwatch.Frequency * 1.5);
+
+            lock (frameLock)
+            {
+                // If no frame has arrived for 1.5 seconds, game is idle/paused/closed
+                if (lastFrameWallClock == 0 || (now - lastFrameWallClock) > timeoutLimit)
+                {
+                    CurrentFps = 0.0;
+                    AvgFps = 0.0;
+                    OnePercentLowFps = 0.0;
+                    CurrentFrameTimeMs = 0.0;
+                    rollingFpsHistory.Clear();
+                    recentFrameTimes.Clear();
+                    wasInLoadingScreen = true;
+                }
+                else
+                {
+                    // 1. Current FPS: 1.0-second rolling window across recent frames (rock-solid, zero micro-hiccups)
+                    if (recentFrameTimes.Count >= 4)
+                    {
+                        double sumMs = 0;
+                        int sampleCount = 0;
+                        for (int i = recentFrameTimes.Count - 1; i >= 0; i--)
+                        {
+                            sumMs += recentFrameTimes[i];
+                            sampleCount++;
+                            if (sumMs >= 1000.0) // 1.0 second window of rendered frames
+                            {
+                                break;
+                            }
+                        }
+
+                        double measuredFps = (sumMs > 0 && sampleCount > 0) ? (sampleCount * 1000.0 / sumMs) : 0.0;
+                        CurrentFps = Math.Round(measuredFps, 0);
+                        CurrentFrameTimeMs = (sampleCount > 0) ? Math.Round(sumMs / sampleCount, 1) : 0.0;
+
+                        // 2. 1% Low FPS: Lowest 1% of FPS in a 4.0-second time window
+                        List<double> windowFpsList = new List<double>();
+                        double windowSumMs = 0;
+                        for (int i = recentFrameTimes.Count - 1; i >= 0; i--)
+                        {
+                            double frameMs = recentFrameTimes[i];
+                            windowSumMs += frameMs;
+                            if (frameMs >= 2.5 && frameMs <= 150.0) // legitimate gameplay frame times
+                            {
+                                windowFpsList.Add(1000.0 / frameMs);
+                            }
+                            if (windowSumMs >= 4000.0) // 4.0 second time window
+                            {
+                                break;
+                            }
+                        }
+
+                        if (windowFpsList.Count >= 8)
+                        {
+                            windowFpsList.Sort(); // Ascending: lowest FPS first
+                            int lowCount = Math.Max(1, (int)Math.Ceiling(windowFpsList.Count * 0.01));
+                            double lowFpsSum = 0;
+                            for (int i = 0; i < lowCount; i++)
+                            {
+                                lowFpsSum += windowFpsList[i];
+                            }
+                            double rawOneLow = Math.Round(lowFpsSum / lowCount, 0);
+
+                            // 1% Low cannot realistically exceed Current FPS
+                            rawOneLow = Math.Min(CurrentFps, rawOneLow);
+
+                            // Smooth 1% Low with exponential moving average to prevent strobe jitter
+                            if (OnePercentLowFps <= 0)
+                            {
+                                OnePercentLowFps = rawOneLow;
+                            }
+                            else
+                            {
+                                OnePercentLowFps = Math.Round(OnePercentLowFps * 0.65 + rawOneLow * 0.35, 0);
+                            }
+                        }
+                        else
+                        {
+                            OnePercentLowFps = Math.Round(CurrentFps * 0.9, 0);
+                        }
+
+                        // 3. Average FPS: Protected against static loading screen spikes (> 260 FPS)
+                        bool isLoadingScreen = (CurrentFps > 260.0);
+                        if (isLoadingScreen)
+                        {
+                            wasInLoadingScreen = true;
+                            AvgFps = CurrentFps;
+                        }
+                        else
+                        {
+                            if (wasInLoadingScreen)
+                            {
+                                // Clean transition from loading screen into gameplay!
+                                rollingFpsHistory.Clear();
+                                recentFrameTimes.Clear();
+                                wasInLoadingScreen = false;
+                            }
+
+                            if (CurrentFps > 0)
+                            {
+                                rollingFpsHistory.Enqueue(CurrentFps);
+                                if (rollingFpsHistory.Count > 60) // ~12 seconds rolling average
+                                {
+                                    rollingFpsHistory.Dequeue();
+                                }
+                                double avgSum = 0;
+                                foreach (double s in rollingFpsHistory) avgSum += s;
+                                AvgFps = Math.Round(avgSum / rollingFpsHistory.Count, 0);
+                            }
+                        }
+                    }
+                    else if (recentFrameTimes.Count > 0)
+                    {
+                        double lastMs = recentFrameTimes[recentFrameTimes.Count - 1];
+                        CurrentFps = (lastMs > 0) ? Math.Round(1000.0 / lastMs, 0) : 0.0;
+                        CurrentFrameTimeMs = Math.Round(lastMs, 1);
+                        OnePercentLowFps = Math.Round(CurrentFps * 0.9, 0);
+                        AvgFps = CurrentFps;
+                    }
+                }
+            }
+        }
+
+        public static void Stop()
+        {
+            isRunning = false;
+            try
+            {
+                if (consumerHandle != IntPtr.Zero && consumerHandle != (IntPtr)(-1))
+                {
+                    CloseTrace(consumerHandle);
+                    consumerHandle = IntPtr.Zero;
+                }
+                if (sessionHandle != 0 && pProperties != IntPtr.Zero)
+                {
+                    ControlTrace(sessionHandle, SessionName, pProperties, EVENT_CONTROL_CODE_STOP_TRACE);
+                    sessionHandle = 0;
+                }
+                if (pLogFile != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(pLogFile);
+                    pLogFile = IntPtr.Zero;
+                }
+                if (pLoggerName != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(pLoggerName);
+                    pLoggerName = IntPtr.Zero;
+                }
+                if (pProperties != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(pProperties);
+                    pProperties = IntPtr.Zero;
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ==========================================
+    // MINIMAL COCKPIT IN-GAME METRICS OVERLAY WINDOW
+    // ==========================================
+    public class MetricsOverlayWindow : Window
+    {
+        public const int GWL_EXSTYLE = -20;
+        public const int WS_EX_TOPMOST = 0x00000008;
+        public const int WS_EX_TRANSPARENT = 0x00000020;
+        public const int WS_EX_LAYERED = 0x00080000;
+        public const int WS_EX_NOACTIVATE = 0x08000000;
+        public const int WS_EX_TOOLWINDOW = 0x00000080;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        private Border rootBorder;
+        private StackPanel stackHorizontal;
+        private Grid gridMatrix;
+
+        private TextBlock txtFps;
+        private TextBlock txtAvgFps;
+        private TextBlock txtOneLow;
+        private TextBlock txtGpuTemp;
+        private TextBlock txtGpuUsage;
+        private TextBlock txtGpuWatts;
+        private TextBlock txtCpuTemp;
+        private TextBlock txtCpuUsage;
+        private TextBlock txtCpuWatts;
+        private TextBlock txtRamUsage;
+
+        private TextBlock txtMatrixFps;
+        private TextBlock txtMatrixTarget;
+        private TextBlock txtMatrixGpu;
+        private TextBlock txtMatrixCpu;
+        private TextBlock txtMatrixRam;
+
+        private OverlayPosition currentPosition = OverlayPosition.TopLeft;
+        private OverlayStyle currentStyle = OverlayStyle.HorizontalBar;
+
+        public MetricsOverlayWindow()
+        {
+            this.Title = "AspireSense In-Game HUD";
+            this.WindowStyle = WindowStyle.None;
+            this.AllowsTransparency = true;
+            this.Background = Brushes.Transparent;
+            this.Topmost = true;
+            this.ShowInTaskbar = false;
+            this.SizeToContent = SizeToContent.WidthAndHeight;
+
+            BuildUI();
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            try
+            {
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+                SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+            }
+            catch { }
+            Reposition();
+        }
+
+        private void BuildUI()
+        {
+            rootBorder = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(235, 11, 15, 25)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(140, 31, 41, 61)),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12, 6, 12, 6),
+                Effect = new DropShadowEffect { Color = Colors.Black, BlurRadius = 14, ShadowDepth = 2, Opacity = 0.8 }
+            };
+
+            // 1. Horizontal HUD Bar (Single line precision telemetry)
+            stackHorizontal = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+
+            // FPS Block
+            StackPanel spFps = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 6, 0) };
+            spFps.Children.Add(new TextBlock { Text = "FPS ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary, VerticalAlignment = VerticalAlignment.Center });
+            txtFps = new TextBlock { Text = "--", FontSize = 14, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentGreen, VerticalAlignment = VerticalAlignment.Center };
+            spFps.Children.Add(txtFps);
+            stackHorizontal.Children.Add(spFps);
+
+            // AVG FPS Block
+            StackPanel spAvg = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 6, 0) };
+            spAvg.Children.Add(new TextBlock { Text = "AVG ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary, VerticalAlignment = VerticalAlignment.Center });
+            txtAvgFps = new TextBlock { Text = "--", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentBlue, VerticalAlignment = VerticalAlignment.Center };
+            spAvg.Children.Add(txtAvgFps);
+            stackHorizontal.Children.Add(spAvg);
+
+            // 1% Low Block
+            StackPanel spOneLow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4, 0, 6, 0) };
+            spOneLow.Children.Add(new TextBlock { Text = "1% ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary, VerticalAlignment = VerticalAlignment.Center });
+            txtOneLow = new TextBlock { Text = "--", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentCyan, VerticalAlignment = VerticalAlignment.Center };
+            spOneLow.Children.Add(txtOneLow);
+            stackHorizontal.Children.Add(spOneLow);
+            stackHorizontal.Children.Add(CreateDivider());
+
+            // GPU Block
+            StackPanel spGpu = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 6, 0) };
+            spGpu.Children.Add(new TextBlock { Text = "GPU ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentCyan, VerticalAlignment = VerticalAlignment.Center });
+            txtGpuTemp = new TextBlock { Text = "--°C", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, VerticalAlignment = VerticalAlignment.Center };
+            spGpu.Children.Add(txtGpuTemp);
+            txtGpuUsage = new TextBlock { Text = "0%", FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentAmber, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(5, 0, 0, 0) };
+            spGpu.Children.Add(txtGpuUsage);
+            txtGpuWatts = new TextBlock { Text = "0W", FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentCyan, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(5, 0, 0, 0) };
+            spGpu.Children.Add(txtGpuWatts);
+            stackHorizontal.Children.Add(spGpu);
+            stackHorizontal.Children.Add(CreateDivider());
+
+            // CPU Block
+            StackPanel spCpu = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 6, 0) };
+            spCpu.Children.Add(new TextBlock { Text = "CPU ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentBlue, VerticalAlignment = VerticalAlignment.Center });
+            txtCpuTemp = new TextBlock { Text = "--°C", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, VerticalAlignment = VerticalAlignment.Center };
+            spCpu.Children.Add(txtCpuTemp);
+            txtCpuUsage = new TextBlock { Text = "0%", FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentBlue, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(5, 0, 0, 0) };
+            spCpu.Children.Add(txtCpuUsage);
+            txtCpuWatts = new TextBlock { Text = "0W", FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentGreen, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(5, 0, 0, 0) };
+            spCpu.Children.Add(txtCpuWatts);
+            stackHorizontal.Children.Add(spCpu);
+            stackHorizontal.Children.Add(CreateDivider());
+
+            // RAM Block
+            StackPanel spRam = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 2, 0) };
+            spRam.Children.Add(new TextBlock { Text = "RAM ", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentPurple, VerticalAlignment = VerticalAlignment.Center });
+            txtRamUsage = new TextBlock { Text = "-- GB", FontSize = 11.5, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, VerticalAlignment = VerticalAlignment.Center };
+            spRam.Children.Add(txtRamUsage);
+            stackHorizontal.Children.Add(spRam);
+
+            // 2. Compact Matrix Layout (2-row badge)
+            gridMatrix = new Grid { Visibility = Visibility.Collapsed, MinWidth = 230 };
+            gridMatrix.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            gridMatrix.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            Grid topRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            txtMatrixFps = new TextBlock { Text = "FPS: -- (1% Low: --)", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentGreen };
+            Grid.SetColumn(txtMatrixFps, 0);
+            topRow.Children.Add(txtMatrixFps);
+
+            txtMatrixTarget = new TextBlock { Text = "Desktop", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary };
+            Grid.SetColumn(txtMatrixTarget, 1);
+            topRow.Children.Add(txtMatrixTarget);
+
+            Grid.SetRow(topRow, 0);
+            gridMatrix.Children.Add(topRow);
+
+            StackPanel botRow = new StackPanel { Orientation = Orientation.Horizontal };
+            txtMatrixGpu = new TextBlock { Text = "GPU: --°C (0%)", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentCyan, Margin = new Thickness(0, 0, 8, 0) };
+            txtMatrixCpu = new TextBlock { Text = "CPU: --°C (0%)", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentBlue, Margin = new Thickness(0, 0, 8, 0) };
+            txtMatrixRam = new TextBlock { Text = "RAM: -- GB", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentPurple };
+            botRow.Children.Add(txtMatrixGpu);
+            botRow.Children.Add(txtMatrixCpu);
+            botRow.Children.Add(txtMatrixRam);
+
+            Grid.SetRow(botRow, 1);
+            gridMatrix.Children.Add(botRow);
+
+            Grid contentHolder = new Grid();
+            contentHolder.Children.Add(stackHorizontal);
+            contentHolder.Children.Add(gridMatrix);
+
+            rootBorder.Child = contentHolder;
+            this.Content = rootBorder;
+        }
+
+        private Border CreateDivider()
+        {
+            return new Border
+            {
+                Width = 1,
+                Height = 14,
+                Background = DesignTokens.BrushBorderSubtle,
+                Margin = new Thickness(5, 0, 5, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+
+        public void SetPositionPreset(OverlayPosition pos)
+        {
+            currentPosition = pos;
+            Reposition();
+        }
+
+        public void SetStylePreset(OverlayStyle style)
+        {
+            currentStyle = style;
+            if (style == OverlayStyle.HorizontalBar)
+            {
+                stackHorizontal.Visibility = Visibility.Visible;
+                gridMatrix.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                stackHorizontal.Visibility = Visibility.Collapsed;
+                gridMatrix.Visibility = Visibility.Visible;
+            }
+            this.UpdateLayout();
+            Reposition();
+        }
+
+        public void Reposition()
+        {
+            double scrW = SystemParameters.PrimaryScreenWidth;
+            double scrH = SystemParameters.PrimaryScreenHeight;
+            double w = this.ActualWidth > 0 ? this.ActualWidth : 380;
+            double h = this.ActualHeight > 0 ? this.ActualHeight : 45;
+
+            switch (currentPosition)
+            {
+                case OverlayPosition.TopLeft:
+                    this.Left = 24;
+                    this.Top = 24;
+                    break;
+                case OverlayPosition.TopRight:
+                    this.Left = scrW - w - 24;
+                    this.Top = 24;
+                    break;
+                case OverlayPosition.CenterTop:
+                    this.Left = (scrW - w) / 2.0;
+                    this.Top = 16;
+                    break;
+                case OverlayPosition.BottomLeft:
+                    this.Left = 24;
+                    this.Top = scrH - h - 48;
+                    break;
+                case OverlayPosition.BottomRight:
+                    this.Left = scrW - w - 24;
+                    this.Top = scrH - h - 48;
+                    break;
+            }
+        }
+
+        public void UpdateMetrics(double fps, double avgFps, double oneLow, int gpuTemp, float gpuUsage, float gpuWatts, int cpuTemp, float cpuUsage, float cpuWatts, double ramGb, float ramPct, string targetName)
+        {
+            if (fps > 0)
+            {
+                txtFps.Text = string.Format("{0:F0}", fps);
+                txtAvgFps.Text = string.Format("{0:F0}", avgFps > 0 ? avgFps : fps);
+                txtOneLow.Text = string.Format("{0:F0}", oneLow);
+                txtFps.Foreground = fps >= 60 ? new SolidColorBrush(Color.FromRgb(0, 255, 140)) : (fps >= 30 ? new SolidColorBrush(Color.FromRgb(0, 210, 255)) : new SolidColorBrush(Color.FromRgb(255, 42, 85)));
+                txtAvgFps.Foreground = (avgFps >= 60 || (avgFps == 0 && fps >= 60)) ? new SolidColorBrush(Color.FromRgb(56, 189, 248)) : new SolidColorBrush(Color.FromRgb(0, 210, 255));
+                txtOneLow.Foreground = oneLow >= 45 ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : new SolidColorBrush(Color.FromRgb(255, 170, 0));
+            }
+            else
+            {
+                txtFps.Text = "--";
+                txtAvgFps.Text = "--";
+                txtOneLow.Text = "--";
+                txtFps.Foreground = new SolidColorBrush(Color.FromRgb(120, 150, 180));
+                txtAvgFps.Foreground = new SolidColorBrush(Color.FromRgb(120, 150, 180));
+                txtOneLow.Foreground = new SolidColorBrush(Color.FromRgb(120, 150, 180));
+            }
+
+            txtGpuTemp.Text = string.Format("{0}°C", gpuTemp);
+            txtGpuUsage.Text = string.Format("{0:F0}%", gpuUsage);
+            txtGpuWatts.Text = (gpuWatts > 0) ? string.Format("{0:F0}W", gpuWatts) : "0W";
+            txtGpuTemp.Foreground = gpuTemp < 72 ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : (gpuTemp < 85 ? new SolidColorBrush(Color.FromRgb(255, 170, 0)) : new SolidColorBrush(Color.FromRgb(255, 42, 85)));
+
+            txtCpuTemp.Text = string.Format("{0}°C", cpuTemp);
+            txtCpuUsage.Text = string.Format("{0:F0}%", cpuUsage);
+            txtCpuWatts.Text = (cpuWatts > 0) ? string.Format("{0:F0}W", cpuWatts) : "0W";
+            txtCpuTemp.Foreground = cpuTemp < 75 ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : (cpuTemp < 88 ? new SolidColorBrush(Color.FromRgb(255, 170, 0)) : new SolidColorBrush(Color.FromRgb(255, 42, 85)));
+
+            txtRamUsage.Text = string.Format("{0:F1}G ({1:F0}%)", ramGb, ramPct);
+
+            if (txtMatrixFps != null)
+            {
+                txtMatrixFps.Text = (fps > 0) ? string.Format("FPS: {0:F0} (AVG: {1:F0} | 1% LOW: {2:F0})", fps, avgFps > 0 ? avgFps : fps, oneLow) : "FPS: -- (AVG: -- | 1% LOW: --)";
+                txtMatrixTarget.Text = !string.IsNullOrEmpty(targetName) ? targetName : "Desktop";
+                txtMatrixGpu.Text = string.Format("GPU: {0}°C ({1:F0}% | {2:F0}W)", gpuTemp, gpuUsage, gpuWatts);
+                txtMatrixCpu.Text = string.Format("CPU: {0}°C ({1:F0}% | {2:F0}W)", cpuTemp, cpuUsage, cpuWatts);
+                txtMatrixRam.Text = string.Format("RAM: {0:F1} GB ({1:F0}%)", ramGb, ramPct);
+            }
+        }
+    }
+
+    // ==========================================
     // MAIN APPLICATION WINDOW: ASPIRESENSE
     // ==========================================
     public class MainWindow : Window
@@ -2041,6 +3457,33 @@ namespace AspireSense
         private Grid viewCooling;
         private Grid viewGaming;
         private Grid viewHealth;
+        private Grid viewEcGuard;
+
+        // Dashboard EC Guard Controls
+        private Border btnDashboardEcGuard;
+        private TextBlock lblDashboardEcGuardIndicator;
+        private TextBlock lblDashboardEcGuardStatus;
+        private Border btnToolEcGuard;
+
+        // EC Guard View (Tab 4) Controls
+        private TextBlock lblEcRawDie;
+        private TextBlock lblEcThermalEma;
+        private TextBlock lblEcSpikesCount;
+        private TextBlock lblEcAcousticHold;
+        private TextBlock lblEcClassifierState;
+        private SegmentedMeter meterHeatsinkSaturation;
+        private TextBlock lblHeatsinkSatText;
+        private Border btnEcMasterToggle;
+        private TextBlock lblEcMasterToggleText;
+        private List<Border> ecClampButtons = new List<Border>();
+        private List<Border> ecHysteresisButtons = new List<Border>();
+        private List<Border> ecFailsafeButtons = new List<Border>();
+        private Border btnEcGameToggle;
+        private TextBlock lblEcGameToggleText;
+        private Border btnEcBoostTamer;
+        private TextBlock lblEcBoostTamerText;
+        private TextBlock lblEcBoostTamerStatus;
+        private TextBlock txtDecisionLog;
 
         // Dashboard Speedometers
         private SpeedometerGauge cpuSpeedo;
@@ -2058,7 +3501,45 @@ namespace AspireSense
         private int heatFlushRemaining = 0;
         private List<Border> curveCards = new List<Border>();
 
-        // Gaming Hub Controls
+        // Gaming Hub & In-Game Overlay Controls
+        private MetricsOverlayWindow overlayWindow;
+        private DispatcherTimer overlayTimer;
+        private bool isOverlayActive = false;
+        private OverlayPosition currentOverlayPos = OverlayPosition.TopLeft;
+        private OverlayStyle currentOverlayStyle = OverlayStyle.HorizontalBar;
+
+        private Border btnOverlayMasterToggle;
+        private TextBlock lblOverlayMasterToggleText;
+        private TextBlock lblOverlayStatusSub;
+
+        private Border btnPosTL, btnPosTR, btnPosTC, btnPosBL, btnPosBR;
+        private Border btnStyleHoriz, btnStyleMatrix;
+
+        private TextBlock lblHubFpsVal;
+        private TextBlock lblHubOneLowVal;
+        private TextBlock lblHubFrameTimeVal;
+        private SegmentedMeter meterHubStability;
+        private TextBlock lblHubGpuVal;
+        private SegmentedMeter meterHubGpu;
+        private TextBlock lblHubCpuVal;
+        private SegmentedMeter meterHubCpu;
+        private TextBlock lblHubRamVal;
+        private SegmentedMeter meterHubRam;
+        private TextBlock lblHubTargetApp;
+        private TextBlock lblHubEngineStatus;
+
+        public const uint MOD_CONTROL = 0x0002;
+        public const uint MOD_SHIFT = 0x0004;
+        public const uint MOD_NOREPEAT = 0x4000;
+        public const int WM_HOTKEY = 0x0312;
+        public const uint VK_O = 0x4F;
+
+        [DllImport("user32.dll")]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
         private TextBlock lblScenarioStatus;
         private TextBlock lblGamePing;
         private int pingTick = 0;
@@ -2092,6 +3573,11 @@ namespace AspireSense
         private Border btnQuiet;
         private Border btnMax;
 
+        private TextBlock lblModeDesc;
+        private TextBlock lblDiagPower;
+        private TextBlock lblDiagBattery;
+        private TextBlock lblDiagUptime;
+
         private Slider sliderCustom;
         private TextBlock lblCustomVal;
         private TextBlock lblStatusMsg;
@@ -2102,6 +3588,10 @@ namespace AspireSense
 
         private int currentFanMode = 0; // 0=Auto, 1=Max, 3=Quiet, 6=Custom
         private int currentCustomDuty = 75;
+        private int watchdogHighHeatCount = 0;
+        private int watchdogCoolCount = 0;
+        private bool watchdogActive = false;
+        private int watchdogPreviousMode = 0;
 
         public MainWindow()
         {
@@ -2133,13 +3623,24 @@ namespace AspireSense
             catch { }
 
             HardwareBridge.InitializeHardware();
+            HardwareBridge.ResetToAuto();
+            overlayWindow = new MetricsOverlayWindow();
 
             BuildLayout();
+
+            EcAntiHallucinationEngine.CheckCurrentPowerPlanState();
+            EcAntiHallucinationEngine.LogDecision("ASPIRASENSE ARBITER INITIALIZED: Monitoring real thermal energy vs transient bursts");
+            UpdateDashboardEcGuardUi();
 
             timer = new DispatcherTimer();
             timer.Interval = TimeSpan.FromSeconds(1);
             timer.Tick += Timer_Tick;
             timer.Start();
+
+            overlayTimer = new DispatcherTimer();
+            overlayTimer.Interval = TimeSpan.FromMilliseconds(250);
+            overlayTimer.Tick += OverlayTimer_Tick;
+            // Note: overlayTimer and GameTelemetryEngine are started on-demand via EnsureTelemetryState()
 
             // CRITICAL HARDWARE SAFETY: Reset EC fan controller to Auto when app is closed, terminated, or crashes
             this.Closing += (s, e) =>
@@ -2148,6 +3649,27 @@ namespace AspireSense
                 {
                     timer.Stop();
                 }
+                if (overlayTimer != null)
+                {
+                    overlayTimer.Stop();
+                }
+                if (overlayWindow != null)
+                {
+                    try { overlayWindow.Close(); } catch { }
+                    overlayWindow = null;
+                }
+                GameTelemetryEngine.Stop();
+
+                try
+                {
+                    IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        UnregisterHotKey(hwnd, 9001);
+                    }
+                }
+                catch { }
+
                 if (cpuCounter != null)
                 {
                     try { cpuCounter.Dispose(); } catch { }
@@ -2169,26 +3691,163 @@ namespace AspireSense
             Timer_Tick(null, null);
         }
 
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            try
+            {
+                HwndSource source = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+                if (source != null)
+                {
+                    source.AddHook(HwndHook);
+                    RegisterHotKey(source.Handle, 9001, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_O);
+                }
+            }
+            catch { }
+        }
+
+        private IntPtr HwndHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WM_HOTKEY && wParam.ToInt32() == 9001)
+            {
+                ToggleOverlay();
+                handled = true;
+            }
+            return IntPtr.Zero;
+        }
+
+        private void EnsureTelemetryState()
+        {
+            bool needTelemetry = isOverlayActive || (viewGaming != null && viewGaming.Visibility == Visibility.Visible);
+            if (needTelemetry)
+            {
+                GameTelemetryEngine.Start();
+                if (overlayTimer != null && !overlayTimer.IsEnabled)
+                {
+                    overlayTimer.Start();
+                }
+            }
+            else
+            {
+                GameTelemetryEngine.Stop();
+                if (overlayTimer != null && overlayTimer.IsEnabled)
+                {
+                    overlayTimer.Stop();
+                }
+            }
+        }
+
+        private void ToggleOverlay()
+        {
+            isOverlayActive = !isOverlayActive;
+            if (overlayWindow != null)
+            {
+                if (isOverlayActive)
+                {
+                    overlayWindow.Show();
+                    overlayWindow.Reposition();
+                }
+                else
+                {
+                    overlayWindow.Hide();
+                }
+            }
+            UpdateOverlayToggleButton();
+            EnsureTelemetryState();
+        }
+
+        private void UpdateOverlayToggleButton()
+        {
+            if (btnOverlayMasterToggle == null || lblOverlayMasterToggleText == null) return;
+            if (isOverlayActive)
+            {
+                btnOverlayMasterToggle.Background = new SolidColorBrush(Color.FromArgb(200, 10, 45, 30));
+                btnOverlayMasterToggle.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                lblOverlayMasterToggleText.Text = "🟢 IN-GAME OVERLAY: ACTIVE (ON)";
+                lblOverlayMasterToggleText.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                if (lblOverlayStatusSub != null)
+                {
+                    lblOverlayStatusSub.Text = "HUD ACTIVE ON DISPLAY • PRESS [CTRL + SHIFT + O] TO HIDE";
+                    lblOverlayStatusSub.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                }
+            }
+            else
+            {
+                btnOverlayMasterToggle.Background = new SolidColorBrush(Color.FromArgb(160, 14, 20, 32));
+                btnOverlayMasterToggle.BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 180, 255));
+                lblOverlayMasterToggleText.Text = "⚪ IN-GAME OVERLAY: STANDBY (OFF)";
+                lblOverlayMasterToggleText.Foreground = new SolidColorBrush(Color.FromRgb(150, 185, 220));
+                if (lblOverlayStatusSub != null)
+                {
+                    lblOverlayStatusSub.Text = "GLOBAL HOTKEY: PRESS [CTRL + SHIFT + O] TO ACTIVATE ANYTIME";
+                    lblOverlayStatusSub.Foreground = new SolidColorBrush(Color.FromRgb(110, 150, 190));
+                }
+            }
+        }
+
+        private void SetOverlayPosition(OverlayPosition pos)
+        {
+            currentOverlayPos = pos;
+            if (overlayWindow != null)
+            {
+                overlayWindow.SetPositionPreset(pos);
+            }
+            UpdatePositionButtonStyles();
+        }
+
+        private void UpdatePositionButtonStyles()
+        {
+            SetPillStyle(btnPosTL, currentOverlayPos == OverlayPosition.TopLeft);
+            SetPillStyle(btnPosTR, currentOverlayPos == OverlayPosition.TopRight);
+            SetPillStyle(btnPosTC, currentOverlayPos == OverlayPosition.CenterTop);
+            SetPillStyle(btnPosBL, currentOverlayPos == OverlayPosition.BottomLeft);
+            SetPillStyle(btnPosBR, currentOverlayPos == OverlayPosition.BottomRight);
+        }
+
+        private void SetOverlayStyle(OverlayStyle style)
+        {
+            currentOverlayStyle = style;
+            if (overlayWindow != null)
+            {
+                overlayWindow.SetStylePreset(style);
+            }
+            SetPillStyle(btnStyleHoriz, currentOverlayStyle == OverlayStyle.HorizontalBar);
+            SetPillStyle(btnStyleMatrix, currentOverlayStyle == OverlayStyle.CompactMatrix);
+        }
+
+        private void SetPillStyle(Border pill, bool isActive)
+        {
+            if (pill == null) return;
+            pill.Background = isActive ? new SolidColorBrush(Color.FromArgb(190, 0, 110, 180)) : new SolidColorBrush(Color.FromArgb(140, 14, 22, 35));
+            pill.BorderBrush = isActive ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : new SolidColorBrush(Color.FromArgb(60, 0, 160, 240));
+            TextBlock tb = pill.Child as TextBlock;
+            if (tb != null)
+            {
+                tb.Foreground = isActive ? Brushes.White : new SolidColorBrush(Color.FromRgb(130, 165, 205));
+                tb.FontWeight = isActive ? FontWeights.Bold : FontWeights.Normal;
+            }
+        }
+
         private void BuildLayout()
         {
             Grid root = new Grid();
 
             RadialGradientBrush bgGradient = new RadialGradientBrush
             {
-                Center = new Point(0.5, 0.45),
-                RadiusX = 0.8,
-                RadiusY = 0.7,
+                Center = new Point(0.5, 0.4),
+                RadiusX = 0.9,
+                RadiusY = 0.8,
                 GradientStops = new GradientStopCollection
                 {
-                    new GradientStop(Color.FromArgb(70, 0, 75, 160), 0.0),
-                    new GradientStop(Color.FromArgb(25, 0, 30, 80), 0.5),
-                    new GradientStop(Color.FromArgb(0, 0, 0, 0), 1.0)
+                    new GradientStop(Color.FromArgb(30, 0, 100, 200), 0.0),
+                    new GradientStop(Color.FromRgb(12, 16, 28), 0.6),
+                    new GradientStop(DesignTokens.BgWindow, 1.0)
                 }
             };
             root.Background = bgGradient;
 
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) });  // Titlebar
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(42) });  // Sub-banner
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) });  // Sub-banner
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // Viewport
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) });  // Footer Bar
 
@@ -2207,11 +3866,13 @@ namespace AspireSense
             viewCooling = CreateCoolingView();
             viewGaming = CreateGamingView();
             viewHealth = CreateHealthView();
+            viewEcGuard = CreateEcGuardView();
 
             viewHost.Children.Add(viewDashboard);
             viewHost.Children.Add(viewCooling);
             viewHost.Children.Add(viewGaming);
             viewHost.Children.Add(viewHealth);
+            viewHost.Children.Add(viewEcGuard);
 
             // Default: Show Dashboard
             SwitchTab(0);
@@ -2228,12 +3889,12 @@ namespace AspireSense
 
         private Grid CreateTopBar()
         {
-            Grid bar = new Grid { Background = new SolidColorBrush(Color.FromRgb(10, 14, 25)) };
+            Grid bar = new Grid { Background = DesignTokens.BrushBgWindow };
             bar.MouseDown += (s, e) => { if (e.LeftButton == MouseButtonState.Pressed) this.DragMove(); };
 
-            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
+            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(200) });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(140) });
+            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(120) });
 
             StackPanel logoPanel = new StackPanel
             {
@@ -2256,10 +3917,9 @@ namespace AspireSense
                     Image imgLogo = new Image
                     {
                         Source = bmp,
-                        Width = 30,
-                        Height = 30,
-                        Margin = new Thickness(0, 0, 10, 0),
-                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 14, ShadowDepth = 0, Opacity = 0.85 }
+                        Width = 26,
+                        Height = 26,
+                        Margin = new Thickness(0, 0, 10, 0)
                     };
                     logoPanel.Children.Add(imgLogo);
                 }
@@ -2269,10 +3929,10 @@ namespace AspireSense
             {
                 Path aLogo = new Path
                 {
-                    Width = 24,
-                    Height = 24,
+                    Width = 22,
+                    Height = 22,
                     Stretch = Stretch.Fill,
-                    Fill = new LinearGradientBrush(Color.FromRgb(0, 210, 255), Color.FromRgb(0, 100, 255), 45),
+                    Fill = DesignTokens.BrushAccentCyan,
                     Data = Geometry.Parse("M 12,2 L 22,22 L 17,22 L 14,15 L 10,15 L 7,22 L 2,22 Z M 12,8 L 10.5,12 L 13.5,12 Z"),
                     Margin = new Thickness(0, 0, 10, 0)
                 };
@@ -2281,71 +3941,87 @@ namespace AspireSense
 
             TextBlock txtLogo = new TextBlock
             {
-                Text = "ASPIRESENSE",
-                FontSize = 17,
-                FontWeight = FontWeights.Black,
-                Foreground = Brushes.White,
+                Text = "AspireSense",
+                FontSize = 16,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
                 VerticalAlignment = VerticalAlignment.Center
             };
             logoPanel.Children.Add(txtLogo);
             Grid.SetColumn(logoPanel, 0);
             bar.Children.Add(logoPanel);
 
-            // Fully Functional Tabs
+            // Fully Functional Tabs in Segmented Pill Container
+            Border pillContainer = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(3),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(16, 0, 0, 0)
+            };
+
             StackPanel tabs = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                VerticalAlignment = VerticalAlignment.Center,
-                HorizontalAlignment = HorizontalAlignment.Left,
-                Margin = new Thickness(25, 0, 0, 0)
+                VerticalAlignment = VerticalAlignment.Center
             };
 
             navTabs.Add(CreateTab("Dashboard", 0));
             navTabs.Add(CreateTab("Cooling Control", 1));
             navTabs.Add(CreateTab("Gaming Hub", 2));
             navTabs.Add(CreateTab("System Health", 3));
+            navTabs.Add(CreateTab("🛡️ EC Arbiter", 4));
 
             foreach (Border tab in navTabs)
             {
                 tabs.Children.Add(tab);
             }
+            pillContainer.Child = tabs;
 
-            Grid.SetColumn(tabs, 1);
-            bar.Children.Add(tabs);
+            Grid.SetColumn(pillContainer, 1);
+            bar.Children.Add(pillContainer);
 
             StackPanel winBtnSp = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
                 VerticalAlignment = VerticalAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 0, 15, 0)
+                Margin = new Thickness(0, 0, 12, 0)
             };
 
             Button btnMin = new Button
             {
                 Content = "—",
-                Width = 35,
+                Width = 36,
                 Height = 30,
-                Foreground = Brushes.White,
+                Foreground = DesignTokens.BrushTextSecondary,
                 Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
                 Cursor = Cursors.Hand,
                 FontWeight = FontWeights.Bold
             };
+            btnMin.MouseEnter += (s, e) => { btnMin.Background = DesignTokens.BrushBgCardHover; btnMin.Foreground = DesignTokens.BrushTextPrimary; };
+            btnMin.MouseLeave += (s, e) => { btnMin.Background = Brushes.Transparent; btnMin.Foreground = DesignTokens.BrushTextSecondary; };
             btnMin.Click += (s, e) => { this.WindowState = WindowState.Minimized; };
             winBtnSp.Children.Add(btnMin);
 
             Button btnClose = new Button
             {
                 Content = "✕",
-                Width = 35,
+                Width = 36,
                 Height = 30,
-                Foreground = Brushes.White,
+                Foreground = DesignTokens.BrushTextSecondary,
                 Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
                 Cursor = Cursors.Hand,
                 FontWeight = FontWeights.Bold
             };
+            btnClose.MouseEnter += (s, e) => { btnClose.Background = DesignTokens.BrushAccentRed; btnClose.Foreground = Brushes.White; };
+            btnClose.MouseLeave += (s, e) => { btnClose.Background = Brushes.Transparent; btnClose.Foreground = DesignTokens.BrushTextSecondary; };
             btnClose.Click += (s, e) => { this.Close(); };
             winBtnSp.Children.Add(btnClose);
 
@@ -2359,21 +4035,37 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Margin = new Thickness(10, 0, 10, 0),
-                Padding = new Thickness(14, 10, 14, 10),
-                BorderThickness = new Thickness(0, 0, 0, 2),
+                Margin = new Thickness(2, 0, 2, 0),
+                Padding = new Thickness(14, 6, 14, 6),
+                BorderThickness = new Thickness(1),
                 BorderBrush = Brushes.Transparent,
+                CornerRadius = new CornerRadius(7),
                 Cursor = Cursors.Hand,
                 Tag = index
             };
             TextBlock t = new TextBlock
             {
                 Text = title,
-                FontSize = 13,
-                FontWeight = FontWeights.Normal,
-                Foreground = new SolidColorBrush(Color.FromRgb(150, 170, 200))
+                FontSize = 12,
+                FontWeight = FontWeights.Medium,
+                Foreground = DesignTokens.BrushTextSecondary
             };
             b.Child = t;
+
+            b.MouseEnter += (s, e) => {
+                if (b.BorderBrush == Brushes.Transparent)
+                {
+                    b.Background = DesignTokens.BrushBgCardHover;
+                    t.Foreground = DesignTokens.BrushTextPrimary;
+                }
+            };
+            b.MouseLeave += (s, e) => {
+                if (b.BorderBrush == Brushes.Transparent)
+                {
+                    b.Background = Brushes.Transparent;
+                    t.Foreground = DesignTokens.BrushTextSecondary;
+                }
+            };
 
             b.MouseDown += (s, e) => { SwitchTab(index); };
             return b;
@@ -2385,76 +4077,93 @@ namespace AspireSense
             viewCooling.Visibility = (tabIndex == 1) ? Visibility.Visible : Visibility.Collapsed;
             viewGaming.Visibility = (tabIndex == 2) ? Visibility.Visible : Visibility.Collapsed;
             viewHealth.Visibility = (tabIndex == 3) ? Visibility.Visible : Visibility.Collapsed;
+            if (viewEcGuard != null)
+            {
+                viewEcGuard.Visibility = (tabIndex == 4) ? Visibility.Visible : Visibility.Collapsed;
+            }
 
             for (int i = 0; i < navTabs.Count; i++)
             {
                 bool active = (i == tabIndex);
-                navTabs[i].BorderBrush = active ? new SolidColorBrush(Color.FromRgb(0, 210, 255)) : Brushes.Transparent;
+                navTabs[i].BorderBrush = active ? DesignTokens.BrushBorderSubtleLight : Brushes.Transparent;
+                navTabs[i].Background = active ? DesignTokens.BrushBgCardActive : Brushes.Transparent;
                 TextBlock tb = navTabs[i].Child as TextBlock;
                 if (tb != null)
                 {
-                    tb.Foreground = active ? Brushes.White : new SolidColorBrush(Color.FromRgb(150, 170, 200));
-                    tb.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
+                    tb.Foreground = active ? Brushes.White : DesignTokens.BrushTextSecondary;
+                    tb.FontWeight = active ? FontWeights.Bold : FontWeights.Medium;
                 }
             }
+            EnsureTelemetryState();
         }
 
         private Grid CreateSubBanner()
         {
-            Grid g = new Grid { Margin = new Thickness(30, 8, 30, 0) };
+            Grid g = new Grid { Margin = new Thickness(30, 2, 30, 0), Height = 28 };
+            Border badge = new Border
+            {
+                CornerRadius = new CornerRadius(12),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(12, 3, 12, 3),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
             StackPanel sp = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
 
             TextBlock tag = new TextBlock
             {
-                Text = "ACTIVE COOLING PROFILE: ",
-                FontSize = 11,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(120, 160, 210))
+                Text = "Active Profile: ",
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary
             };
             lblStatusMsg = new TextBlock
             {
-                Text = "DYNAMIC AUTO (WHISPER QUIET)",
-                FontSize = 11,
-                FontWeight = FontWeights.Black,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255))
+                Text = "Auto (Balanced adaptive)",
+                FontSize = 10.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentCyan
             };
             sp.Children.Add(tag);
             sp.Children.Add(lblStatusMsg);
-            g.Children.Add(sp);
+            badge.Child = sp;
+            g.Children.Add(badge);
             return g;
         }
 
         // ==========================================
-        // PAGE 1: MAIN DASHBOARD VIEW
+        // PAGE 1: MAIN DASHBOARD VIEW (APPLE DESIGN CRAFT)
         // ==========================================
         private Grid CreateDashboardView()
         {
             Grid root = new Grid();
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(85) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(82) });
 
-            Grid g = new Grid { Margin = new Thickness(30, 10, 30, 10) };
+            Grid g = new Grid { Margin = new Thickness(30, 8, 30, 8) };
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(350) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(350) });
 
-            string cpuGaugeTitle = "INTEL CORE™ PROCESSOR";
+            string cpuGaugeTitle = "Intel Core™ Processor";
             if (!string.IsNullOrEmpty(HardwareBridge.ChassisCpuName))
             {
                 if (HardwareBridge.ChassisCpuName.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0)
-                    cpuGaugeTitle = "AMD RYZEN™ PROCESSOR";
+                    cpuGaugeTitle = "AMD Ryzen™ Processor";
                 else if (HardwareBridge.ChassisCpuName.IndexOf("Intel", StringComparison.OrdinalIgnoreCase) >= 0)
-                    cpuGaugeTitle = "INTEL CORE™ PROCESSOR";
+                    cpuGaugeTitle = "Intel Core™ Processor";
                 else
-                    cpuGaugeTitle = HardwareBridge.ChassisCpuName.ToUpperInvariant();
+                    cpuGaugeTitle = HardwareBridge.ChassisCpuName;
             }
 
             string gpuGaugeTitle = !string.IsNullOrEmpty(HardwareBridge.ChassisGpuName)
-                ? HardwareBridge.ChassisGpuName.ToUpperInvariant()
-                : "NVIDIA GEFORCE GPU";
+                ? HardwareBridge.ChassisGpuName
+                : "NVIDIA GeForce GPU";
 
             Border cpuBox = CreateSpeedoCard();
-            cpuSpeedo = new SpeedometerGauge(cpuGaugeTitle, "CPU Workload & Thermal Sensor", 320);
+            cpuSpeedo = new SpeedometerGauge(cpuGaugeTitle, "CPU package & workload sensor", 320, false);
             cpuBox.Child = cpuSpeedo;
             Grid.SetColumn(cpuBox, 0);
             g.Children.Add(cpuBox);
@@ -2464,7 +4173,7 @@ namespace AspireSense
             g.Children.Add(centerBox);
 
             Border gpuBox = CreateSpeedoCard();
-            gpuSpeedo = new SpeedometerGauge(gpuGaugeTitle, "Hardware Sensor via NVML", 320);
+            gpuSpeedo = new SpeedometerGauge(gpuGaugeTitle, "Hardware sensor via NVML", 320, true);
             gpuBox.Child = gpuSpeedo;
             Grid.SetColumn(gpuBox, 2);
             g.Children.Add(gpuBox);
@@ -2483,27 +4192,17 @@ namespace AspireSense
         {
             return new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(210, 12, 17, 30)),
-                CornerRadius = new CornerRadius(12),
-                BorderBrush = new LinearGradientBrush
-                {
-                    StartPoint = new Point(0, 0),
-                    EndPoint = new Point(1, 1),
-                    GradientStops = new GradientStopCollection
-                    {
-                        new GradientStop(Color.FromArgb(180, 0, 180, 255), 0.0),
-                        new GradientStop(Color.FromArgb(60, 20, 40, 70), 0.5),
-                        new GradientStop(Color.FromArgb(120, 0, 120, 255), 1.0)
-                    }
-                },
-                BorderThickness = new Thickness(1.5),
-                Padding = new Thickness(15),
+                Background = DesignTokens.BrushBgCard,
+                CornerRadius = new CornerRadius(14),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(16),
                 Effect = new DropShadowEffect
                 {
-                    Color = Color.FromRgb(0, 100, 200),
+                    Color = Colors.Black,
                     BlurRadius = 20,
-                    ShadowDepth = 0,
-                    Opacity = 0.3
+                    ShadowDepth = 2,
+                    Opacity = 0.4
                 }
             };
         }
@@ -2512,117 +4211,178 @@ namespace AspireSense
         {
             Border card = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(210, 11, 16, 28)),
+                Background = DesignTokens.BrushBgCard,
                 CornerRadius = new CornerRadius(14),
-                BorderBrush = new LinearGradientBrush
-                {
-                    StartPoint = new Point(0, 0),
-                    EndPoint = new Point(1, 1),
-                    GradientStops = new GradientStopCollection
-                    {
-                        new GradientStop(Color.FromArgb(180, 0, 180, 255), 0.0),
-                        new GradientStop(Color.FromArgb(50, 15, 30, 55), 0.5),
-                        new GradientStop(Color.FromArgb(140, 0, 140, 255), 1.0)
-                    }
-                },
-                BorderThickness = new Thickness(1.5),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
                 Margin = new Thickness(12, 0, 12, 0),
-                Padding = new Thickness(14, 12, 14, 12),
+                Padding = new Thickness(18, 16, 18, 16),
                 Effect = new DropShadowEffect
                 {
-                    Color = Color.FromRgb(0, 140, 255),
-                    BlurRadius = 22,
-                    ShadowDepth = 0,
-                    Opacity = 0.25
+                    Color = Colors.Black,
+                    BlurRadius = 20,
+                    ShadowDepth = 2,
+                    Opacity = 0.4
                 }
             };
 
             StackPanel sp = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
 
-            // Cockpit Instrument Cluster Header with Logo
-            StackPanel headSp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12) };
-            string logoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logo.png");
-            if (File.Exists(logoPath))
-            {
-                try
-                {
-                    System.Windows.Media.Imaging.BitmapImage bmpCenter = new System.Windows.Media.Imaging.BitmapImage();
-                    bmpCenter.BeginInit();
-                    bmpCenter.UriSource = new Uri(logoPath, UriKind.Absolute);
-                    bmpCenter.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                    bmpCenter.EndInit();
+            // 1. Control Center Section Header
+            StackPanel headSp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 14) };
 
-                    Image imgCenter = new Image
-                    {
-                        Source = bmpCenter,
-                        Width = 56,
-                        Height = 56,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        Margin = new Thickness(0, 0, 0, 6),
-                        Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 24, ShadowDepth = 0, Opacity = 0.9 }
-                    };
-                    headSp.Children.Add(imgCenter);
-                }
-                catch { }
-            }
-            else
+            Border tagBadge = new Border
             {
-                Path logoCenter = new Path
-                {
-                    Width = 46,
-                    Height = 46,
-                    Stretch = Stretch.Fill,
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    Fill = new LinearGradientBrush(Color.FromRgb(0, 225, 255), Color.FromRgb(0, 100, 255), 45),
-                    Data = Geometry.Parse("M 20,2 L 38,36 L 30,36 L 24,24 L 16,24 L 10,36 L 2,36 Z M 20,11 L 18,18 L 22,18 Z"),
-                    Effect = new DropShadowEffect { Color = Color.FromRgb(0, 210, 255), BlurRadius = 22, ShadowDepth = 0, Opacity = 0.85 },
-                    Margin = new Thickness(0, 0, 0, 6)
-                };
-                headSp.Children.Add(logoCenter);
-            }
+                CornerRadius = new CornerRadius(5),
+                Background = new SolidColorBrush(Color.FromArgb(40, 0, 122, 255)),
+                BorderBrush = DesignTokens.BrushAccentBlue,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 2, 8, 2),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            TextBlock tagTxt = new TextBlock
+            {
+                Text = "🎛️ CONTROL CENTER",
+                FontSize = 9.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentBlue
+            };
+            tagBadge.Child = tagTxt;
+            headSp.Children.Add(tagBadge);
 
             TextBlock title = new TextBlock
             {
-                Text = "FAN PROFILE SELECTOR",
-                FontSize = 13,
-                FontWeight = FontWeights.Black,
-                Foreground = Brushes.White,
+                Text = "Drive & Acoustic Policy",
+                FontSize = 15,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
                 HorizontalAlignment = HorizontalAlignment.Center
             };
             headSp.Children.Add(title);
 
-            TextBlock subTitle = new TextBlock
+            lblModeDesc = new TextBlock
             {
-                Text = "ACTIVE THERMAL PROFILE & FAN OVERRIDE",
-                FontSize = 8,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(100, 150, 205)),
+                Text = "Auto: Adaptive closed-loop cooling balancing acoustics and silicon thermals.",
+                FontSize = 10.5,
+                Foreground = DesignTokens.BrushTextSecondary,
                 HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 2, 0, 0)
+                TextAlignment = TextAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 4, 0, 0),
+                MaxWidth = 360
             };
-            headSp.Children.Add(subTitle);
+            headSp.Children.Add(lblModeDesc);
+
+            // Dashboard EC Anti-Hallucination Guard Status & Toggle Pill
+            btnDashboardEcGuard = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(40, 16, 185, 129)),
+                BorderBrush = DesignTokens.BrushAccentGreen,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(9),
+                Padding = new Thickness(12, 6, 12, 6),
+                Margin = new Thickness(0, 10, 0, 0),
+                Cursor = Cursors.Hand
+            };
+
+            Grid ecG = new Grid();
+            ecG.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            ecG.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            StackPanel ecTextSp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            lblDashboardEcGuardIndicator = new TextBlock
+            {
+                Text = "🛡️ EC Guard: ACTIVE",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentGreen,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            ecTextSp.Children.Add(lblDashboardEcGuardIndicator);
+
+            lblDashboardEcGuardStatus = new TextBlock
+            {
+                Text = "Whisper Silent (35%)",
+                FontSize = 10.5,
+                Foreground = DesignTokens.BrushTextSecondary,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            ecTextSp.Children.Add(lblDashboardEcGuardStatus);
+            Grid.SetColumn(ecTextSp, 0);
+            ecG.Children.Add(ecTextSp);
+
+            Border btnOpenArbiter = new Border
+            {
+                Background = DesignTokens.BrushBgCardHover,
+                BorderBrush = DesignTokens.BrushBorderSubtleLight,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(8, 2, 8, 2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand
+            };
+            TextBlock txtArb = new TextBlock
+            {
+                Text = "Arbiter ❯",
+                FontSize = 9.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentCyan
+            };
+            btnOpenArbiter.Child = txtArb;
+            btnOpenArbiter.MouseDown += (s, e) => { SwitchTab(4); e.Handled = true; };
+            Grid.SetColumn(btnOpenArbiter, 1);
+            ecG.Children.Add(btnOpenArbiter);
+
+            btnDashboardEcGuard.Child = ecG;
+            btnDashboardEcGuard.MouseDown += (s, e) =>
+            {
+                EcAntiHallucinationEngine.Toggle();
+                UpdateDashboardEcGuardUi();
+            };
+            headSp.Children.Add(btnDashboardEcGuard);
+
             sp.Children.Add(headSp);
 
-            // 3 Instrument Profile Switches: QUIET | AUTO | MAX
-            UniformGrid toggleGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 0, 0, 14) };
+            // 2. macOS-Style Segmented Control Bar
+            Border segContainer = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(12),
+                Padding = new Thickness(3),
+                Margin = new Thickness(0, 0, 0, 16)
+            };
 
-            btnQuiet = CreateDriveModeButton("QUIET", "SILENT ACOUSTIC", Color.FromRgb(0, 229, 255), false, () => ApplyMode(3, "QUIET (SILENT ACOUSTIC)"));
-            btnAuto = CreateDriveModeButton("AUTO", "BALANCED ADAPTIVE", Color.FromRgb(0, 144, 255), true, () => ApplyMode(0, "AUTO (BALANCED ADAPTIVE)"));
-            btnMax = CreateDriveModeButton("MAX", "100% TURBO BOOST", Color.FromRgb(255, 30, 86), false, () => ApplyMode(1, "MAX 100% TURBO BOOST"));
+            Grid segGrid = new Grid { Height = 44 };
+            segGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            segGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            segGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            toggleGrid.Children.Add(btnQuiet);
-            toggleGrid.Children.Add(btnAuto);
-            toggleGrid.Children.Add(btnMax);
-            sp.Children.Add(toggleGrid);
+            btnQuiet = CreateDriveModeButton("🌙 Quiet", "Silent", DesignTokens.AccentCyan, false, () => ApplyMode(3, "Quiet: Whisper-quiet acoustic profile with capped blower RPM."));
+            btnAuto = CreateDriveModeButton("✨ Auto", "Adaptive", DesignTokens.AccentBlue, true, () => ApplyMode(0, "Auto: Adaptive closed-loop cooling balancing acoustics and silicon thermals."));
+            btnMax = CreateDriveModeButton("🔥 Max", "Turbo", DesignTokens.AccentRed, false, () => ApplyMode(1, "Max: 100% emergency blower speed for sustained heavy compute."));
 
-            // Automotive Manual Throttle Console
+            Grid.SetColumn(btnQuiet, 0);
+            Grid.SetColumn(btnAuto, 1);
+            Grid.SetColumn(btnMax, 2);
+
+            segGrid.Children.Add(btnQuiet);
+            segGrid.Children.Add(btnAuto);
+            segGrid.Children.Add(btnMax);
+            segContainer.Child = segGrid;
+            sp.Children.Add(segContainer);
+
+            // 3. Manual Blower Override Capsule
             Border overrideBox = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(170, 13, 20, 34)),
-                CornerRadius = new CornerRadius(8),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 160, 255)),
+                Background = DesignTokens.BrushBgInput,
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(12, 10, 12, 10)
+                Padding = new Thickness(14, 12, 14, 12),
+                Margin = new Thickness(0, 0, 0, 14)
             };
 
             StackPanel overSp = new StackPanel();
@@ -2630,20 +4390,30 @@ namespace AspireSense
             Grid sliderHeader = new Grid();
             sliderHeader.Children.Add(new TextBlock
             {
-                Text = "MANUAL FAN OVERRIDE",
-                FontSize = 9.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(130, 170, 215))
-            });
-            lblCustomVal = new TextBlock
-            {
-                Text = "75% SPEED",
+                Text = "Manual Fan Override",
                 FontSize = 11,
-                FontWeight = FontWeights.Black,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255)),
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextPrimary
+            });
+
+            Border customValPill = new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                Background = new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)),
+                BorderBrush = DesignTokens.BrushAccentCyan,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 2, 8, 2),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
-            sliderHeader.Children.Add(lblCustomVal);
+            lblCustomVal = new TextBlock
+            {
+                Text = "75% Duty",
+                FontSize = 10.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentCyan
+            };
+            customValPill.Child = lblCustomVal;
+            sliderHeader.Children.Add(customValPill);
             overSp.Children.Add(sliderHeader);
 
             sliderCustom = new Slider
@@ -2652,20 +4422,20 @@ namespace AspireSense
                 Maximum = 100,
                 Value = 75,
                 TickFrequency = 5,
-                Margin = new Thickness(0, 6, 0, 8)
+                Margin = new Thickness(0, 10, 0, 10)
             };
-            sliderCustom.ValueChanged += (s, e) => { lblCustomVal.Text = string.Format("{0:F0}% SPEED", sliderCustom.Value); };
+            sliderCustom.ValueChanged += (s, e) => { lblCustomVal.Text = string.Format("{0:F0}% Duty", sliderCustom.Value); };
             overSp.Children.Add(sliderCustom);
 
             Button btnApplyCustom = new Button
             {
-                Content = "ENGAGE MANUAL OVERRIDE",
-                FontSize = 10,
-                FontWeight = FontWeights.Black,
+                Content = "Apply Manual Override",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
-                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 75, 185), 45),
+                Background = DesignTokens.BrushAccentBlue,
                 BorderThickness = new Thickness(0),
-                Height = 30,
+                Height = 32,
                 Cursor = Cursors.Hand
             };
             btnApplyCustom.Click += (s, e) =>
@@ -2676,54 +4446,77 @@ namespace AspireSense
                 {
                     currentFanMode = 6;
                     currentCustomDuty = target;
-                    lblStatusMsg.Text = string.Format("MANUAL OVERRIDE ({0}%) ACTIVE", target);
-                    UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
-                    UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
-                    UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
+                    lblStatusMsg.Text = string.Format("Manual Override ({0}%) Active", target);
+                    if (lblModeDesc != null) lblModeDesc.Text = string.Format("Manual Override: Blowers locked at constant {0}% duty cycle.", target);
+                    UpdateDriveModeButton(btnAuto, false, DesignTokens.AccentBlue);
+                    UpdateDriveModeButton(btnQuiet, false, DesignTokens.AccentCyan);
+                    UpdateDriveModeButton(btnMax, false, DesignTokens.AccentRed);
                 }
             };
             overSp.Children.Add(btnApplyCustom);
-
             overrideBox.Child = overSp;
             sp.Children.Add(overrideBox);
 
+            // 4. Live System Diagnostics Capsule Strip
+            UniformGrid diagGrid = new UniformGrid { Columns = 3, Rows = 1 };
+
+            Border podPower = CreateDiagPod("⚡ AC Power", out lblDiagPower);
+            Border podBattery = CreateDiagPod("🛡️ Battery", out lblDiagBattery);
+            Border podUptime = CreateDiagPod("⏱️ Uptime", out lblDiagUptime);
+
+            diagGrid.Children.Add(podPower);
+            diagGrid.Children.Add(podBattery);
+            diagGrid.Children.Add(podUptime);
+            sp.Children.Add(diagGrid);
+
             card.Child = sp;
             return card;
+        }
+
+        private Border CreateDiagPod(string initialText, out TextBlock tb)
+        {
+            Border b = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(4, 5, 4, 5),
+                Margin = new Thickness(2, 0, 2, 0)
+            };
+            tb = new TextBlock
+            {
+                Text = initialText,
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary,
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            b.Child = tb;
+            return b;
         }
 
         private Border CreateDriveModeButton(string text, string subtitle, Color accent, bool isSelected, Action onClick)
         {
             Border b = new Border
             {
-                Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, accent.R, accent.G, accent.B)) : new SolidColorBrush(Color.FromArgb(130, 14, 20, 34)),
-                BorderBrush = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(70, 40, 60, 90)),
-                BorderThickness = new Thickness(1.5),
-                CornerRadius = new CornerRadius(8),
-                Margin = new Thickness(4, 0, 4, 0),
-                Padding = new Thickness(6, 10, 6, 10),
+                Background = isSelected ? new SolidColorBrush(accent) : Brushes.Transparent,
+                BorderBrush = isSelected ? new SolidColorBrush(accent) : Brushes.Transparent,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(9),
+                Margin = new Thickness(2),
                 Cursor = Cursors.Hand,
-                Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 14, ShadowDepth = 0, Opacity = 0.6 } : null
+                Tag = isSelected,
+                Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 8, ShadowDepth = 0, Opacity = 0.4 } : null
             };
 
-            StackPanel sp = new StackPanel();
-
-            Border led = new Border
-            {
-                Width = 18,
-                Height = 3,
-                CornerRadius = new CornerRadius(1.5),
-                Background = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(60, 60, 80, 110)),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            sp.Children.Add(led);
-
+            StackPanel sp = new StackPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
             TextBlock tb = new TextBlock
             {
                 Text = text,
                 FontSize = 11.5,
-                FontWeight = FontWeights.Black,
-                Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(160, 185, 215)),
+                FontWeight = isSelected ? FontWeights.Bold : FontWeights.SemiBold,
+                Foreground = isSelected ? Brushes.White : DesignTokens.BrushTextSecondary,
                 HorizontalAlignment = HorizontalAlignment.Center
             };
             sp.Children.Add(tb);
@@ -2731,15 +4524,29 @@ namespace AspireSense
             TextBlock sub = new TextBlock
             {
                 Text = subtitle,
-                FontSize = 8,
-                FontWeight = FontWeights.Bold,
-                Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : new SolidColorBrush(Color.FromRgb(100, 130, 160)),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 3, 0, 0)
+                FontSize = 9.0,
+                Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)) : DesignTokens.BrushTextMuted,
+                HorizontalAlignment = HorizontalAlignment.Center
             };
             sp.Children.Add(sub);
 
             b.Child = sp;
+
+            b.MouseEnter += (s, e) => {
+                if (b.Tag == null || !(bool)b.Tag)
+                {
+                    b.Background = DesignTokens.BrushBgCardHover;
+                    tb.Foreground = DesignTokens.BrushTextPrimary;
+                }
+            };
+            b.MouseLeave += (s, e) => {
+                if (b.Tag == null || !(bool)b.Tag)
+                {
+                    b.Background = Brushes.Transparent;
+                    tb.Foreground = DesignTokens.BrushTextSecondary;
+                }
+            };
+
             b.MouseDown += (s, e) => { onClick(); };
             return b;
         }
@@ -2747,27 +4554,24 @@ namespace AspireSense
         private void UpdateDriveModeButton(Border b, bool isSelected, Color accent)
         {
             if (b == null) return;
-            b.Background = isSelected ? new SolidColorBrush(Color.FromArgb(160, accent.R, accent.G, accent.B)) : new SolidColorBrush(Color.FromArgb(130, 14, 20, 34));
-            b.BorderBrush = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(70, 40, 60, 90));
-            b.Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 14, ShadowDepth = 0, Opacity = 0.6 } : null;
+            b.Tag = isSelected;
+            b.Background = isSelected ? new SolidColorBrush(accent) : Brushes.Transparent;
+            b.BorderBrush = isSelected ? new SolidColorBrush(accent) : Brushes.Transparent;
+            b.Effect = isSelected ? new DropShadowEffect { Color = accent, BlurRadius = 8, ShadowDepth = 0, Opacity = 0.4 } : null;
 
             StackPanel sp = b.Child as StackPanel;
-            if (sp != null && sp.Children.Count >= 3)
+            if (sp != null && sp.Children.Count >= 2)
             {
-                Border led = sp.Children[0] as Border;
-                if (led != null)
-                {
-                    led.Background = isSelected ? new SolidColorBrush(accent) : new SolidColorBrush(Color.FromArgb(60, 60, 80, 110));
-                }
-                TextBlock tb = sp.Children[1] as TextBlock;
+                TextBlock tb = sp.Children[0] as TextBlock;
+                TextBlock sub = sp.Children[1] as TextBlock;
                 if (tb != null)
                 {
-                    tb.Foreground = isSelected ? Brushes.White : new SolidColorBrush(Color.FromRgb(160, 185, 215));
+                    tb.Foreground = isSelected ? Brushes.White : DesignTokens.BrushTextSecondary;
+                    tb.FontWeight = isSelected ? FontWeights.Bold : FontWeights.SemiBold;
                 }
-                TextBlock sub = sp.Children[2] as TextBlock;
                 if (sub != null)
                 {
-                    sub.Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : new SolidColorBrush(Color.FromRgb(100, 130, 160));
+                    sub.Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)) : DesignTokens.BrushTextMuted;
                 }
             }
         }
@@ -2777,10 +4581,11 @@ namespace AspireSense
             currentFanMode = mode;
             HardwareBridge.SetFanMode(mode);
             lblStatusMsg.Text = desc;
+            if (lblModeDesc != null) lblModeDesc.Text = desc;
 
-            UpdateDriveModeButton(btnQuiet, mode == 3, Color.FromRgb(0, 229, 255));
-            UpdateDriveModeButton(btnAuto, mode == 0, Color.FromRgb(0, 144, 255));
-            UpdateDriveModeButton(btnMax, mode == 1, Color.FromRgb(255, 30, 86));
+            UpdateDriveModeButton(btnQuiet, mode == 3, DesignTokens.AccentCyan);
+            UpdateDriveModeButton(btnAuto, mode == 0, DesignTokens.AccentBlue);
+            UpdateDriveModeButton(btnMax, mode == 1, DesignTokens.AccentRed);
         }
 
         private Grid CreateGamingToolsHub()
@@ -2788,20 +4593,20 @@ namespace AspireSense
             Grid g = new Grid { Margin = new Thickness(30, 0, 30, 8) };
             Border card = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(190, 10, 15, 26)),
-                CornerRadius = new CornerRadius(8),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 0, 140, 255)),
+                Background = DesignTokens.BrushBgCard,
+                CornerRadius = new CornerRadius(12),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(15, 8, 15, 8)
+                Padding = new Thickness(16, 8, 16, 8)
             };
 
             Grid inner = new Grid();
-            inner.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(220) });
+            inner.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
             inner.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
             StackPanel ramSp = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            ramSp.Children.Add(new TextBlock { Text = "SYSTEM MEMORY LOAD", FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 160, 220)) });
-            lblRamStats = new TextBlock { Text = "RAM: --% (-- / -- GB)", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = Brushes.White, Margin = new Thickness(0, 2, 0, 0) };
+            ramSp.Children.Add(new TextBlock { Text = "SYSTEM MEMORY", FontSize = 9.5, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextMuted });
+            lblRamStats = new TextBlock { Text = "RAM: --% (-- / -- GB)", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, Margin = new Thickness(0, 2, 0, 0) };
             ramSp.Children.Add(lblRamStats);
             Grid.SetColumn(ramSp, 0);
             inner.Children.Add(ramSp);
@@ -2813,32 +4618,62 @@ namespace AspireSense
                 VerticalAlignment = VerticalAlignment.Center
             };
 
-            Border btnRamBoost = CreateToolButton("⚡ BOOST RAM", () =>
+            btnToolEcGuard = CreateToolButton("🛡️ EC Guard: ON", () =>
+            {
+                EcAntiHallucinationEngine.Toggle();
+                UpdateDashboardEcGuardUi();
+            });
+            btnSp.Children.Add(btnToolEcGuard);
+
+            Border btnRamBoost = CreateToolButton("⚡ Purge RAM", () =>
             {
                 HardwareBridge.OptimizeMemory();
-                lblStatusMsg.Text = "SYSTEM RAM PURGED & OPTIMIZED";
+                lblStatusMsg.Text = "System RAM purged and optimized";
             });
             btnSp.Children.Add(btnRamBoost);
 
-            btnWinLock = CreateToolButton("🔒 WIN-KEY: UNLOCKED", () =>
+            Border btnHudToggle = CreateToolButton("🎮 In-Game HUD", () =>
+            {
+                ToggleOverlay();
+            });
+            btnSp.Children.Add(btnHudToggle);
+
+            btnWinLock = CreateToolButton("🔒 Win-Key: Unlocked", () =>
             {
                 winKeyLocked = !winKeyLocked;
                 TextBlock tb = btnWinLock.Child as TextBlock;
                 if (tb != null)
                 {
-                    tb.Text = winKeyLocked ? "🔒 WIN-KEY: LOCKED" : "🔓 WIN-KEY: UNLOCKED";
+                    tb.Text = winKeyLocked ? "🔒 Win-Key: Locked" : "🔓 Win-Key: Unlocked";
                 }
-                lblStatusMsg.Text = winKeyLocked ? "GAMING WIN-KEY LOCK ACTIVE" : "WIN-KEY RESTORED";
+                lblStatusMsg.Text = winKeyLocked ? "Gaming Win-Key lock active" : "Win-Key restored";
             });
             btnSp.Children.Add(btnWinLock);
 
-            Border btnTaskMgr = CreateToolButton("📊 TASK MANAGER", () =>
+            Border btnFlush = CreateToolButton("❄️ 60s Heat Flush", () =>
+            {
+                if (heatFlushRemaining > 0)
+                {
+                    heatFlushRemaining = 0;
+                    ApplyMode(0, "Auto (Balanced adaptive)");
+                    if (lblHeatFlushText != null) lblHeatFlushText.Text = "❄️ Engage Turbo Flush";
+                }
+                else
+                {
+                    heatFlushRemaining = 60;
+                    ApplyMode(1, "Max (60s Turbo Heat Flush Engaged)");
+                    if (lblHeatFlushText != null) lblHeatFlushText.Text = "❄️ Flushing... (60s Left)";
+                }
+            });
+            btnSp.Children.Add(btnFlush);
+
+            Border btnTaskMgr = CreateToolButton("📊 Task Manager", () =>
             {
                 try { Process.Start("taskmgr.exe"); } catch { }
             });
             btnSp.Children.Add(btnTaskMgr);
 
-            Border btnNvidia = CreateToolButton("🎮 NVIDIA PANEL", () =>
+            Border btnNvidia = CreateToolButton("🎮 NVIDIA Panel", () =>
             {
                 try { Process.Start("control.exe", "/name Microsoft.NvidiaControlPanel"); }
                 catch
@@ -2860,22 +4695,34 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(150, 18, 25, 42)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 160, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(5),
+                CornerRadius = new CornerRadius(6),
                 Padding = new Thickness(12, 6, 12, 6),
-                Margin = new Thickness(5, 0, 5, 0),
+                Margin = new Thickness(4, 0, 4, 0),
                 Cursor = Cursors.Hand
             };
             TextBlock t = new TextBlock
             {
                 Text = label,
                 FontSize = 10.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(180, 220, 255))
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary
             };
             b.Child = t;
+
+            b.MouseEnter += (s, e) => {
+                b.Background = DesignTokens.BrushBgCardHover;
+                b.BorderBrush = DesignTokens.BrushBorderSubtleLight;
+                t.Foreground = DesignTokens.BrushTextPrimary;
+            };
+            b.MouseLeave += (s, e) => {
+                b.Background = DesignTokens.BrushBgInput;
+                b.BorderBrush = DesignTokens.BrushBorderSubtle;
+                t.Foreground = DesignTokens.BrushTextSecondary;
+            };
+
             b.MouseDown += (s, e) => { action(); };
             return b;
         }
@@ -2887,7 +4734,7 @@ namespace AspireSense
         {
             Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(145) });
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(70) });
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(76) });
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
             // Top: Dual Detailed Fan Cards
@@ -2897,32 +4744,32 @@ namespace AspireSense
 
             // CPU Dedicated Blower Card
             string cpuCoolingSub = (!string.IsNullOrEmpty(HardwareBridge.ChassisCpuName) ? HardwareBridge.ChassisCpuName : "CPU Package") + " Thermal Extraction";
-            Border cpuCard = CreateSectionCard("CPU DEDICATED COOLING BLOWER", cpuCoolingSub);
-            StackPanel cpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
-            lblCoolingCpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(0, 229, 255)) };
-            meterCoolingCpu = new SegmentedMeter(20, Color.FromRgb(0, 229, 255), 12, 6);
+            StackPanel cpuSp = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
+            lblCoolingCpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentCyan };
+            meterCoolingCpu = new SegmentedMeter(20, DesignTokens.AccentCyan, 12, 6);
             meterCoolingCpu.Margin = new Thickness(0, 8, 0, 8);
-            TextBlock cpuSub = new TextBlock { Text = "Dynamic curve active: Ramps smoothly based on CPU package temp", FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(140, 170, 205)) };
+            TextBlock cpuSub = new TextBlock { Text = "Dynamic curve active: Ramps smoothly based on CPU package temp", FontSize = 10, Foreground = DesignTokens.BrushTextSecondary };
             cpuSp.Children.Add(lblCoolingCpuRpm);
             cpuSp.Children.Add(meterCoolingCpu);
             cpuSp.Children.Add(cpuSub);
-            cpuCard.Child = cpuSp;
+
+            Border cpuCard = CreateSectionCard("CPU Dedicated Cooling Blower", cpuCoolingSub, cpuSp);
             Grid.SetColumn(cpuCard, 0);
             topRow.Children.Add(cpuCard);
 
             // GPU Dedicated Blower Card
             string gpuCoolingSub = (!string.IsNullOrEmpty(HardwareBridge.ChassisGpuName) ? HardwareBridge.ChassisGpuName : "GPU Silicon") + " Thermal Extraction";
-            Border gpuCard = CreateSectionCard("GPU DEDICATED COOLING BLOWER", gpuCoolingSub);
-            gpuCard.Margin = new Thickness(14, 0, 0, 0);
-            StackPanel gpuSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
-            lblCoolingGpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Black, Foreground = new SolidColorBrush(Color.FromRgb(56, 189, 248)) };
-            meterCoolingGpu = new SegmentedMeter(20, Color.FromRgb(56, 189, 248), 12, 6);
+            StackPanel gpuSp = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
+            lblCoolingGpuRpm = new TextBlock { Text = "0 RPM (0%)", FontSize = 24, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentBlue };
+            meterCoolingGpu = new SegmentedMeter(20, DesignTokens.AccentBlue, 12, 6);
             meterCoolingGpu.Margin = new Thickness(0, 8, 0, 8);
-            TextBlock gpuSub = new TextBlock { Text = "Zero-RPM passive mode: Blower completely idles when GPU is cold", FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(140, 170, 205)) };
+            TextBlock gpuSub = new TextBlock { Text = "Zero-RPM passive mode: Blower completely idles when GPU is cold", FontSize = 10, Foreground = DesignTokens.BrushTextSecondary };
             gpuSp.Children.Add(lblCoolingGpuRpm);
             gpuSp.Children.Add(meterCoolingGpu);
             gpuSp.Children.Add(gpuSub);
-            gpuCard.Child = gpuSp;
+
+            Border gpuCard = CreateSectionCard("GPU Dedicated Cooling Blower", gpuCoolingSub, gpuSp);
+            gpuCard.Margin = new Thickness(14, 0, 0, 0);
             Grid.SetColumn(gpuCard, 1);
             topRow.Children.Add(gpuCard);
 
@@ -2932,12 +4779,12 @@ namespace AspireSense
             // Middle: 60-Second Turbo Heat Flush Card
             Border flushCard = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(170, 12, 22, 38)),
-                CornerRadius = new CornerRadius(8),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 180, 255)),
+                Background = DesignTokens.BrushBgCard,
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 Margin = new Thickness(0, 10, 0, 0),
-                Padding = new Thickness(16, 8, 16, 8)
+                Padding = new Thickness(16, 12, 16, 12)
             };
             Grid flushGrid = new Grid();
             flushGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -2946,16 +4793,16 @@ namespace AspireSense
             StackPanel fLeft = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
             fLeft.Children.Add(new TextBlock
             {
-                Text = "❄️ 60-SECOND TURBO HEAT FLUSH",
-                FontSize = 12,
+                Text = "❄️ 60-Second Turbo Heat Flush",
+                FontSize = 12.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = Brushes.White
+                Foreground = DesignTokens.BrushTextPrimary
             });
             fLeft.Children.Add(new TextBlock
             {
                 Text = "Instantly cycles blowers at 100% duty for 60 seconds to rapidly purge heat pipes, then auto-restores.",
-                FontSize = 9.5,
-                Foreground = new SolidColorBrush(Color.FromRgb(130, 165, 200)),
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextSecondary,
                 Margin = new Thickness(0, 2, 0, 0)
             });
             Grid.SetColumn(fLeft, 0);
@@ -2963,17 +4810,17 @@ namespace AspireSense
 
             btnHeatFlush = new Border
             {
-                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 70, 180), 45),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                Background = DesignTokens.BrushAccentBlue,
+                BorderBrush = DesignTokens.BrushBorderFocus,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
-                Height = 36,
+                Height = 34,
                 Cursor = Cursors.Hand,
                 VerticalAlignment = VerticalAlignment.Center
             };
             lblHeatFlushText = new TextBlock
             {
-                Text = "❄️ ENGAGE TURBO FLUSH",
+                Text = "❄️ Engage Turbo Flush",
                 FontSize = 11,
                 FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
@@ -2981,19 +4828,21 @@ namespace AspireSense
                 VerticalAlignment = VerticalAlignment.Center
             };
             btnHeatFlush.Child = lblHeatFlushText;
+            btnHeatFlush.MouseEnter += (s, e) => { btnHeatFlush.Background = new SolidColorBrush(Color.FromRgb(2, 132, 199)); };
+            btnHeatFlush.MouseLeave += (s, e) => { btnHeatFlush.Background = DesignTokens.BrushAccentBlue; };
             btnHeatFlush.MouseDown += (s, e) =>
             {
                 if (heatFlushRemaining > 0)
                 {
                     heatFlushRemaining = 0;
-                    ApplyMode(0, "DYNAMIC AUTO (HEAT FLUSH CANCELLED)");
-                    lblHeatFlushText.Text = "❄️ ENGAGE TURBO FLUSH";
+                    ApplyMode(0, "Auto (Balanced adaptive)");
+                    lblHeatFlushText.Text = "❄️ Engage Turbo Flush";
                 }
                 else
                 {
                     heatFlushRemaining = 60;
-                    ApplyMode(1, "60s TURBO HEAT FLUSH ENGAGED");
-                    lblHeatFlushText.Text = "❄️ FLUSHING... (60s LEFT)";
+                    ApplyMode(1, "Max (60s Turbo Heat Flush Engaged)");
+                    lblHeatFlushText.Text = "❄️ Flushing... (60s Left)";
                 }
             };
             Grid.SetColumn(btnHeatFlush, 1);
@@ -3005,34 +4854,32 @@ namespace AspireSense
 
             // Bottom: Fan Curve Architecture & Fine Override
             string curveSub = (HardwareBridge.DetectedVendor == HardwareVendor.Asus)
-                ? "ASUS TUF / ROG ACPI Firmware Dynamic Thermal Curve"
+                ? "ASUS TUF / ROG ACPI Firmware dynamic thermal curve"
                 : (HardwareBridge.DetectedVendor == HardwareVendor.Lenovo)
-                    ? "Lenovo Vantage EC Dynamic Thermal Curve"
+                    ? "Lenovo Vantage EC dynamic thermal curve"
                     : (HardwareBridge.DetectedVendor == HardwareVendor.Hp)
-                        ? "HP Omen / Victus BIOS Thermal Control"
+                        ? "HP Omen / Victus BIOS thermal control"
                         : (HardwareBridge.DetectedVendor == HardwareVendor.Dell)
-                            ? "Dell Alienware / G-Series WMAX Dynamic Curve"
-                            : "Embedded Controller Dynamic 4-Stage Curve";
-            Border bottomCard = CreateSectionCard("HARDWARE FAN CURVE ARCHITECTURE", curveSub);
-            bottomCard.Margin = new Thickness(0, 10, 0, 0);
+                            ? "Dell Alienware / G-Series WMAX dynamic curve"
+                            : "Embedded Controller dynamic 4-stage curve";
 
-            StackPanel botSp = new StackPanel { Margin = new Thickness(18, 12, 18, 12) };
+            StackPanel botSp = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
 
             TextBlock intro = new TextBlock
             {
                 Text = "EC hardware monitors temperatures continuously and modulates blower speed across 4 calibrated thermal stages:",
                 FontSize = 10.5,
-                Foreground = new SolidColorBrush(Color.FromRgb(160, 185, 215)),
+                Foreground = DesignTokens.BrushTextSecondary,
                 Margin = new Thickness(0, 0, 0, 10)
             };
             botSp.Children.Add(intro);
 
             curveCards.Clear();
             UniformGrid curveGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 14) };
-            curveCards.Add(CreateCurveStep("STAGE 1 (IDLE)", "< 50 °C", "28% Duty (Whisper Quiet)"));
-            curveCards.Add(CreateCurveStep("STAGE 2 (CRUISE)", "50 - 70 °C", "50% Duty (Balanced Daily)"));
-            curveCards.Add(CreateCurveStep("STAGE 3 (GAMING)", "70 - 85 °C", "66% Duty (High Airflow)"));
-            curveCards.Add(CreateCurveStep("STAGE 4 (PEAK)", "> 85 °C", "100% Duty (Full Turbo Lock)"));
+            curveCards.Add(CreateCurveStep("Stage 1 (Idle)", "< 50 °C", "28% Duty (Whisper Quiet)"));
+            curveCards.Add(CreateCurveStep("Stage 2 (Cruise)", "50 - 70 °C", "50% Duty (Balanced Daily)"));
+            curveCards.Add(CreateCurveStep("Stage 3 (Gaming)", "70 - 85 °C", "66% Duty (High Airflow)"));
+            curveCards.Add(CreateCurveStep("Stage 4 (Peak)", "> 85 °C", "100% Duty (Full Turbo Lock)"));
 
             foreach (Border cCard in curveCards)
             {
@@ -3047,7 +4894,7 @@ namespace AspireSense
             sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
             sliderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(160) });
 
-            TextBlock lblDed = new TextBlock { Text = "Fine Manual Override:", FontSize = 11, FontWeight = FontWeights.Bold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
+            TextBlock lblDed = new TextBlock { Text = "Fine Manual Override:", FontSize = 11, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(lblDed, 0);
             sliderRow.Children.Add(lblDed);
 
@@ -3056,7 +4903,7 @@ namespace AspireSense
             Grid.SetColumn(sliderDedicatedCustom, 1);
             sliderRow.Children.Add(sliderDedicatedCustom);
 
-            lblDedicatedCustomVal = new TextBlock { Text = "80%", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Center };
+            lblDedicatedCustomVal = new TextBlock { Text = "80%", FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentCyan, VerticalAlignment = VerticalAlignment.Center, TextAlignment = TextAlignment.Center };
             Grid.SetColumn(lblDedicatedCustomVal, 2);
             sliderRow.Children.Add(lblDedicatedCustomVal);
 
@@ -3066,11 +4913,13 @@ namespace AspireSense
                 FontSize = 10.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
-                Background = new LinearGradientBrush(Color.FromRgb(0, 140, 255), Color.FromRgb(0, 80, 200), 45),
+                Background = DesignTokens.BrushAccentBlue,
                 BorderThickness = new Thickness(0),
                 Height = 30,
                 Cursor = Cursors.Hand
             };
+            btnApplyDed.MouseEnter += (s, e) => { btnApplyDed.Background = new SolidColorBrush(Color.FromRgb(2, 132, 199)); };
+            btnApplyDed.MouseLeave += (s, e) => { btnApplyDed.Background = DesignTokens.BrushAccentBlue; };
             btnApplyDed.Click += (s, e) =>
             {
                 int val = (int)sliderDedicatedCustom.Value;
@@ -3079,33 +4928,63 @@ namespace AspireSense
                 {
                     currentFanMode = 6;
                     currentCustomDuty = val;
-                    lblStatusMsg.Text = string.Format("CUSTOM FAN SPEED ({0}%) LOCKED", val);
-                    UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
-                    UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
-                    UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
+                    lblStatusMsg.Text = string.Format("Custom Fan Speed ({0}%) Locked", val);
+                    UpdateDriveModeButton(btnAuto, false, DesignTokens.AccentBlue);
+                    UpdateDriveModeButton(btnQuiet, false, DesignTokens.AccentCyan);
+                    UpdateDriveModeButton(btnMax, false, DesignTokens.AccentRed);
                 }
             };
             Grid.SetColumn(btnApplyDed, 3);
             sliderRow.Children.Add(btnApplyDed);
 
             botSp.Children.Add(sliderRow);
-            bottomCard.Child = botSp;
+
+            Border bottomCard = CreateSectionCard("Hardware Fan Curve Architecture", curveSub, botSp);
+            bottomCard.Margin = new Thickness(0, 10, 0, 0);
             Grid.SetRow(bottomCard, 2);
             g.Children.Add(bottomCard);
 
             return g;
         }
 
-        private Border CreateSectionCard(string title, string subtitle)
+        private Border CreateSectionCard(string title, string subtitle, UIElement content)
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(200, 12, 17, 30)),
+                Background = DesignTokens.BrushBgCard,
                 CornerRadius = new CornerRadius(10),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 140, 255)),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(12)
+                Padding = new Thickness(16, 12, 16, 12)
             };
+            StackPanel wrapper = new StackPanel();
+            if (!string.IsNullOrEmpty(title))
+            {
+                TextBlock t = new TextBlock
+                {
+                    Text = title,
+                    FontSize = 13,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = DesignTokens.BrushTextPrimary
+                };
+                wrapper.Children.Add(t);
+            }
+            if (!string.IsNullOrEmpty(subtitle))
+            {
+                TextBlock s = new TextBlock
+                {
+                    Text = subtitle,
+                    FontSize = 10,
+                    Foreground = DesignTokens.BrushTextSecondary,
+                    Margin = new Thickness(0, 2, 0, 8)
+                };
+                wrapper.Children.Add(s);
+            }
+            if (content != null)
+            {
+                wrapper.Children.Add(content);
+            }
+            b.Child = wrapper;
             return b;
         }
 
@@ -3113,17 +4992,17 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(160, 18, 25, 42)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(70, 0, 160, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(10),
-                Margin = new Thickness(5)
+                Padding = new Thickness(12, 10, 12, 10),
+                Margin = new Thickness(4)
             };
             StackPanel sp = new StackPanel();
-            sp.Children.Add(new TextBlock { Text = label, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 160, 220)) });
-            sp.Children.Add(new TextBlock { Text = temp, FontSize = 18, FontWeight = FontWeights.Black, Foreground = Brushes.White, Margin = new Thickness(0, 2, 0, 2) });
-            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10, Foreground = Brushes.Silver });
+            sp.Children.Add(new TextBlock { Text = label, FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary });
+            sp.Children.Add(new TextBlock { Text = temp, FontSize = 18, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary, Margin = new Thickness(0, 3, 0, 3) });
+            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10, Foreground = DesignTokens.BrushTextMuted });
             b.Child = sp;
             return b;
         }
@@ -3133,14 +5012,331 @@ namespace AspireSense
         // ==========================================
         private Grid CreateGamingView()
         {
-            Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(140) });
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) });
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid rootGrid = new Grid();
 
-            // Top: Scenario Profiles
-            Border scenCard = CreateSectionCard("PERFORMANCE & GAMING SCENARIOS", "Instant System Clock & Cooling Profiles");
-            StackPanel scenSp = new StackPanel { Margin = new Thickness(14, 8, 14, 8) };
+            ScrollViewer sv = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Margin = new Thickness(35, 6, 35, 6)
+            };
+
+            StackPanel mainSp = new StackPanel();
+
+            // ==========================================
+            // 1. IN-GAME OVERLAY CONTROL CENTER
+            // ==========================================
+            StackPanel ocSp = new StackPanel { Margin = new Thickness(0, 6, 0, 4) };
+
+            Grid ocGrid = new Grid();
+            ocGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            ocGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            // Left: Master Toggle
+            StackPanel ocLeft = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+
+            btnOverlayMasterToggle = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(16, 10, 16, 10),
+                Cursor = Cursors.Hand,
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            lblOverlayMasterToggleText = new TextBlock
+            {
+                Text = "⚪ In-Game Overlay: Standby (Off)",
+                FontSize = 12,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextSecondary
+            };
+            btnOverlayMasterToggle.Child = lblOverlayMasterToggleText;
+            btnOverlayMasterToggle.MouseEnter += (s, e) => {
+                if (!isOverlayActive) btnOverlayMasterToggle.Background = DesignTokens.BrushBgCardHover;
+            };
+            btnOverlayMasterToggle.MouseLeave += (s, e) => {
+                if (!isOverlayActive) btnOverlayMasterToggle.Background = DesignTokens.BrushBgInput;
+            };
+            btnOverlayMasterToggle.MouseDown += (s, e) => { ToggleOverlay(); };
+            ocLeft.Children.Add(btnOverlayMasterToggle);
+
+            lblOverlayStatusSub = new TextBlock
+            {
+                Text = "Global shortcut: Press [Ctrl + Shift + O] to toggle anytime in-game",
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(2, 6, 0, 0)
+            };
+            ocLeft.Children.Add(lblOverlayStatusSub);
+            Grid.SetColumn(ocLeft, 0);
+            ocGrid.Children.Add(ocLeft);
+
+            // Right: Position and Style Selectors
+            StackPanel ocRight = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
+
+            // Position Pills Row
+            StackPanel posRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 0, 6) };
+            posRow.Children.Add(new TextBlock
+            {
+                Text = "Position: ",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 6, 0)
+            });
+
+            btnPosTL = CreatePillButton("Top-Left", true, () => { SetOverlayPosition(OverlayPosition.TopLeft); });
+            btnPosTR = CreatePillButton("Top-Right", false, () => { SetOverlayPosition(OverlayPosition.TopRight); });
+            btnPosTC = CreatePillButton("Center-Top", false, () => { SetOverlayPosition(OverlayPosition.CenterTop); });
+            btnPosBL = CreatePillButton("Bottom-Left", false, () => { SetOverlayPosition(OverlayPosition.BottomLeft); });
+            btnPosBR = CreatePillButton("Bottom-Right", false, () => { SetOverlayPosition(OverlayPosition.BottomRight); });
+
+            posRow.Children.Add(btnPosTL);
+            posRow.Children.Add(btnPosTR);
+            posRow.Children.Add(btnPosTC);
+            posRow.Children.Add(btnPosBL);
+            posRow.Children.Add(btnPosBR);
+            ocRight.Children.Add(posRow);
+
+            // Style Pills Row
+            StackPanel styleRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+            styleRow.Children.Add(new TextBlock
+            {
+                Text = "HUD Style: ",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 6, 0)
+            });
+
+            btnStyleHoriz = CreatePillButton("Horizontal Bar", true, () => { SetOverlayStyle(OverlayStyle.HorizontalBar); });
+            btnStyleMatrix = CreatePillButton("Compact Matrix", false, () => { SetOverlayStyle(OverlayStyle.CompactMatrix); });
+
+            styleRow.Children.Add(btnStyleHoriz);
+            styleRow.Children.Add(btnStyleMatrix);
+            ocRight.Children.Add(styleRow);
+
+            Grid.SetColumn(ocRight, 1);
+            ocGrid.Children.Add(ocRight);
+
+            ocSp.Children.Add(ocGrid);
+            Border overlayCtrlCard = CreateSectionCard("In-Game Metrics Overlay & Cockpit HUD", "Zero-hook kernel telemetry, FPS counter, 1% lows & hardware vitals (Zero anti-cheat impact)", ocSp);
+            mainSp.Children.Add(overlayCtrlCard);
+
+            // ==========================================
+            // 2. LIVE GAME OVERLAY STATISTICS PREVIEW DASHBOARD
+            // ==========================================
+            StackPanel hudSp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+
+            // Sub-header showing active process target
+            Grid targetBar = new Grid { Margin = new Thickness(0, 0, 0, 10) };
+            targetBar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            targetBar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            lblHubTargetApp = new TextBlock
+            {
+                Text = "Active Target: Desktop Window Manager",
+                FontSize = 10.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentCyan,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(lblHubTargetApp, 0);
+            targetBar.Children.Add(lblHubTargetApp);
+
+            lblHubEngineStatus = new TextBlock
+            {
+                Text = "⚡ Zero-Hook ETW DirectX Active",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentGreen,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(lblHubEngineStatus, 1);
+            targetBar.Children.Add(lblHubEngineStatus);
+            hudSp.Children.Add(targetBar);
+
+            // 4-Card Live Stats Grid
+            UniformGrid statsGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 0) };
+
+            // Block 1: FRAMERATE & 1% LOW
+            Border cardFps = CreateTelemetryPod("Framerate & Stability", DesignTokens.AccentGreen);
+            StackPanel spCardFps = new StackPanel();
+            spCardFps.Children.Add(new TextBlock { Text = "Framerate & Stability", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentGreen, Margin = new Thickness(0, 0, 0, 4) });
+            lblHubFpsVal = new TextBlock
+            {
+                Text = "-- FPS",
+                FontSize = 24,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentGreen,
+                Margin = new Thickness(0, 0, 0, 2)
+            };
+            spCardFps.Children.Add(lblHubFpsVal);
+
+            lblHubOneLowVal = new TextBlock
+            {
+                Text = "Avg: -- | 1% Low: -- FPS",
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentCyan,
+                Margin = new Thickness(0, 0, 0, 2)
+            };
+            spCardFps.Children.Add(lblHubOneLowVal);
+
+            lblHubFrameTimeVal = new TextBlock
+            {
+                Text = "-- ms Delivery Latency",
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextSecondary,
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            spCardFps.Children.Add(lblHubFrameTimeVal);
+
+            meterHubStability = new SegmentedMeter(12, DesignTokens.AccentGreen, 12, 4);
+            spCardFps.Children.Add(meterHubStability);
+            cardFps.Child = spCardFps;
+            statsGrid.Children.Add(cardFps);
+
+            // Block 2: GPU TELEMETRY
+            Border cardGpu = CreateTelemetryPod("GPU Telemetry", DesignTokens.AccentCyan);
+            StackPanel spCardGpu = new StackPanel();
+            spCardGpu.Children.Add(new TextBlock { Text = "GPU Telemetry", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentCyan, Margin = new Thickness(0, 0, 0, 4) });
+            lblHubGpuVal = new TextBlock
+            {
+                Text = "--°C | 0% | 0W",
+                FontSize = 20,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
+                Margin = new Thickness(0, 2, 0, 2)
+            };
+            spCardGpu.Children.Add(lblHubGpuVal);
+
+            TextBlock lblGpuSub = new TextBlock
+            {
+                Text = HardwareBridge.ChassisGpuName,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentCyan,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            spCardGpu.Children.Add(lblGpuSub);
+
+            meterHubGpu = new SegmentedMeter(12, DesignTokens.AccentCyan, 12, 4);
+            spCardGpu.Children.Add(meterHubGpu);
+
+            TextBlock lblGpuStatSub = new TextBlock
+            {
+                Text = "Core Clock & Dynamic Boost Active",
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 4, 0, 0)
+            };
+            spCardGpu.Children.Add(lblGpuStatSub);
+            cardGpu.Child = spCardGpu;
+            statsGrid.Children.Add(cardGpu);
+
+            // Block 3: CPU TELEMETRY
+            Border cardCpu = CreateTelemetryPod("CPU Telemetry", DesignTokens.AccentBlue);
+            StackPanel spCardCpu = new StackPanel();
+            spCardCpu.Children.Add(new TextBlock { Text = "CPU Telemetry", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentBlue, Margin = new Thickness(0, 0, 0, 4) });
+            lblHubCpuVal = new TextBlock
+            {
+                Text = "--°C | 0% | 0W",
+                FontSize = 20,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
+                Margin = new Thickness(0, 2, 0, 2)
+            };
+            spCardCpu.Children.Add(lblHubCpuVal);
+
+            TextBlock lblCpuSub = new TextBlock
+            {
+                Text = HardwareBridge.ChassisCpuName,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentBlue,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            spCardCpu.Children.Add(lblCpuSub);
+
+            meterHubCpu = new SegmentedMeter(12, DesignTokens.AccentBlue, 12, 4);
+            spCardCpu.Children.Add(meterHubCpu);
+
+            TextBlock lblCpuStatSub = new TextBlock
+            {
+                Text = "Thread Execution Unconstrained",
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 4, 0, 0)
+            };
+            spCardCpu.Children.Add(lblCpuStatSub);
+            cardCpu.Child = spCardCpu;
+            statsGrid.Children.Add(cardCpu);
+
+            // Block 4: RAM TELEMETRY
+            Border cardRam = CreateTelemetryPod("Memory (RAM)", DesignTokens.AccentPurple);
+            StackPanel spCardRam = new StackPanel();
+            spCardRam.Children.Add(new TextBlock { Text = "Memory (RAM)", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentPurple, Margin = new Thickness(0, 0, 0, 4) });
+            lblHubRamVal = new TextBlock
+            {
+                Text = "-- / -- GB (0%)",
+                FontSize = 18,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushTextPrimary,
+                Margin = new Thickness(0, 3, 0, 2)
+            };
+            spCardRam.Children.Add(lblHubRamVal);
+
+            meterHubRam = new SegmentedMeter(12, DesignTokens.AccentPurple, 12, 4);
+            spCardRam.Children.Add(meterHubRam);
+
+            Border btnPurgeRam = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushAccentPurple,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(10, 4, 10, 4),
+                Margin = new Thickness(0, 6, 0, 0),
+                Cursor = Cursors.Hand,
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            btnPurgeRam.Child = new TextBlock
+            {
+                Text = "🧹 Purge Standby RAM",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromRgb(216, 180, 254))
+            };
+            btnPurgeRam.MouseEnter += (s, e) => { btnPurgeRam.Background = DesignTokens.BrushBgCardHover; };
+            btnPurgeRam.MouseLeave += (s, e) => { btnPurgeRam.Background = DesignTokens.BrushBgInput; };
+            btnPurgeRam.MouseDown += (s, e) =>
+            {
+                HardwareBridge.OptimizeMemory();
+                if (lblStatusMsg != null)
+                {
+                    lblStatusMsg.Text = "System Working Set & Standby RAM Purged";
+                    lblStatusMsg.Foreground = DesignTokens.BrushAccentGreen;
+                }
+            };
+            spCardRam.Children.Add(btnPurgeRam);
+            cardRam.Child = spCardRam;
+            statsGrid.Children.Add(cardRam);
+
+            hudSp.Children.Add(statsGrid);
+
+            Border hudPreviewCard = CreateSectionCard("Live In-Game HUD Telemetry Stream", "Real-time replica of the active in-game overlay metrics", hudSp);
+            hudPreviewCard.Margin = new Thickness(0, 8, 0, 0);
+            mainSp.Children.Add(hudPreviewCard);
+
+            // ==========================================
+            // 3. PERFORMANCE & GAMING SCENARIOS
+            // ==========================================
+            StackPanel scenSp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
 
             Grid scenHeader = new Grid();
             scenHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -3151,7 +5347,7 @@ namespace AspireSense
                 Text = "Current Profile: Dynamic Auto (Balanced)",
                 FontSize = 11,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                Foreground = DesignTokens.BrushAccentCyan,
                 VerticalAlignment = VerticalAlignment.Center
             };
             Grid.SetColumn(lblScenarioStatus, 0);
@@ -3160,30 +5356,32 @@ namespace AspireSense
             // 1-Click ULTRA GAME BOOST Button
             Border btnUltraBoost = new Border
             {
-                Background = new LinearGradientBrush(Color.FromRgb(255, 30, 86), Color.FromRgb(180, 10, 50), 45),
+                Background = DesignTokens.BrushAccentRed,
                 BorderBrush = new SolidColorBrush(Color.FromRgb(255, 100, 140)),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(10, 5, 10, 5),
+                Padding = new Thickness(12, 6, 12, 6),
                 Cursor = Cursors.Hand
             };
             btnUltraBoost.Child = new TextBlock
             {
-                Text = "🚀 ULTRA GAME BOOST",
-                FontSize = 10.5,
-                FontWeight = FontWeights.Black,
+                Text = "🚀 Ultra Game Boost",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
                 HorizontalAlignment = HorizontalAlignment.Center
             };
+            btnUltraBoost.MouseEnter += (s, e) => { btnUltraBoost.Background = new SolidColorBrush(Color.FromRgb(220, 38, 38)); };
+            btnUltraBoost.MouseLeave += (s, e) => { btnUltraBoost.Background = DesignTokens.BrushAccentRed; };
             btnUltraBoost.MouseDown += (s, e) =>
             {
-                ApplyMode(1, "ULTRA GAME BOOST ACTIVE (100% TURBO COOLING)");
+                ApplyMode(1, "Ultra Game Boost Active (100% Turbo Cooling)");
                 HardwareBridge.OptimizeMemory();
                 winKeyLocked = true;
                 if (btnWinLock != null)
                 {
                     TextBlock tb = btnWinLock.Child as TextBlock;
-                    if (tb != null) tb.Text = "🔒 WIN-KEY: LOCKED";
+                    if (tb != null) tb.Text = "🔒 Win-Key: Locked";
                 }
                 try
                 {
@@ -3196,47 +5394,49 @@ namespace AspireSense
                 }
                 catch { }
 
-                lblScenarioStatus.Text = "🚀 ULTRA GAME BOOST ACTIVE (100% FAN + RAM PURGED + WIN-KEY LOCKED)";
-                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                lblScenarioStatus.Text = "🚀 Ultra Game Boost Active (100% Fan + RAM Purged + Win-Key Locked)";
+                lblScenarioStatus.Foreground = DesignTokens.BrushAccentGreen;
             };
             Grid.SetColumn(btnUltraBoost, 1);
             scenHeader.Children.Add(btnUltraBoost);
             scenSp.Children.Add(scenHeader);
 
-            UniformGrid scenGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 8, 0, 0) };
-            scenGrid.Children.Add(CreateScenarioBtn("MAX (TURBO BOOST)", "Maximum cooling, full performance, zero thermal throttling", () =>
+            UniformGrid scenGrid = new UniformGrid { Columns = 3, Margin = new Thickness(0, 10, 0, 0) };
+            scenGrid.Children.Add(CreateScenarioBtn("Max (Turbo Boost)", "Maximum cooling, full performance, zero thermal throttling", () =>
             {
-                ApplyMode(1, "100% MAXIMUM TURBO");
+                ApplyMode(1, "Max (100% Turbo Boost)");
                 lblScenarioStatus.Text = "Active Profile: Max Turbo Boost Mode";
-                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 90));
+                lblScenarioStatus.Foreground = DesignTokens.BrushAccentRed;
             }));
-            scenGrid.Children.Add(CreateScenarioBtn("AUTO (BALANCED)", "Intelligent dynamic thermal and power balance", () =>
+            scenGrid.Children.Add(CreateScenarioBtn("Auto (Balanced)", "Intelligent dynamic thermal and power balance", () =>
             {
-                ApplyMode(0, "DYNAMIC AUTO (BALANCED)");
+                ApplyMode(0, "Auto (Balanced adaptive)");
                 lblScenarioStatus.Text = "Active Profile: Auto Balanced Mode";
-                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
+                lblScenarioStatus.Foreground = DesignTokens.BrushAccentCyan;
             }));
-            scenGrid.Children.Add(CreateScenarioBtn("QUIET (SILENT)", "Whisper-quiet acoustic profile, maximum efficiency", () =>
+            scenGrid.Children.Add(CreateScenarioBtn("Quiet (Silent)", "Whisper-quiet acoustic profile, maximum efficiency", () =>
             {
-                ApplyMode(3, "QUIET (SILENT ACOUSTIC)");
+                ApplyMode(3, "Quiet (Silent acoustic)");
                 lblScenarioStatus.Text = "Active Profile: Quiet Silent Mode";
-                lblScenarioStatus.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
+                lblScenarioStatus.Foreground = DesignTokens.BrushAccentGreen;
             }));
             scenSp.Children.Add(scenGrid);
 
-            scenCard.Child = scenSp;
-            Grid.SetRow(scenCard, 0);
-            g.Children.Add(scenCard);
+            Border scenCard = CreateSectionCard("Performance & Gaming Scenarios", "Instant system clock and cooling profiles", scenSp);
+            scenCard.Margin = new Thickness(0, 8, 0, 0);
+            mainSp.Children.Add(scenCard);
 
-            // Middle: Live Gaming Network Ping Telemetry Ribbon
+            // ==========================================
+            // 4. LIVE GAMING NETWORK PING TELEMETRY RIBBON
+            // ==========================================
             Border pingRibbon = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(170, 10, 16, 28)),
-                CornerRadius = new CornerRadius(8),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 0, 180, 255)),
+                Background = DesignTokens.BrushBgCard,
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 Margin = new Thickness(0, 8, 0, 0),
-                Padding = new Thickness(16, 8, 16, 8)
+                Padding = new Thickness(16, 10, 16, 10)
             };
             Grid pingGrid = new Grid();
             pingGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -3245,17 +5445,17 @@ namespace AspireSense
             StackPanel pLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             pLeft.Children.Add(new TextBlock
             {
-                Text = "🌐 MULTIPLAYER NETWORK TELEMETRY:  ",
-                FontSize = 10,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(120, 155, 195))
+                Text = "🌐 Multiplayer Network Telemetry:  ",
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary
             });
             lblGamePing = new TextBlock
             {
-                Text = "CHECKING CDN LATENCY...",
-                FontSize = 11,
-                FontWeight = FontWeights.Black,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140))
+                Text = "Checking latency...",
+                FontSize = 11.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = DesignTokens.BrushAccentGreen
             };
             pLeft.Children.Add(lblGamePing);
             Grid.SetColumn(pLeft, 0);
@@ -3263,35 +5463,35 @@ namespace AspireSense
 
             Border btnPingNow = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(140, 18, 26, 42)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 180, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(8, 4, 8, 4),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(10, 5, 10, 5),
                 Cursor = Cursors.Hand,
                 VerticalAlignment = VerticalAlignment.Center
             };
             btnPingNow.Child = new TextBlock
             {
-                Text = "⚡ PING NOW",
-                FontSize = 9.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                Text = "⚡ Ping Now",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentCyan,
                 HorizontalAlignment = HorizontalAlignment.Center
             };
+            btnPingNow.MouseEnter += (s, e) => { btnPingNow.Background = DesignTokens.BrushBgCardHover; };
+            btnPingNow.MouseLeave += (s, e) => { btnPingNow.Background = DesignTokens.BrushBgInput; };
             btnPingNow.MouseDown += (s, e) => { CheckPingAsync(); };
             Grid.SetColumn(btnPingNow, 1);
             pingGrid.Children.Add(btnPingNow);
 
             pingRibbon.Child = pingGrid;
-            Grid.SetRow(pingRibbon, 1);
-            g.Children.Add(pingRibbon);
+            mainSp.Children.Add(pingRibbon);
 
-            // Bottom: Tools & System Launchers
-            Border toolsCard = CreateSectionCard("GAMING UTILITIES & HARDWARE ACCELERATION", "Fast access to critical performance tools");
-            toolsCard.Margin = new Thickness(0, 8, 0, 0);
-
-            StackPanel tSp = new StackPanel { Margin = new Thickness(16, 10, 16, 10) };
+            // ==========================================
+            // 5. TOOLS & SYSTEM LAUNCHERS
+            // ==========================================
+            StackPanel tSp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
 
             UniformGrid utilGrid = new UniformGrid { Columns = 2 };
             utilGrid.Children.Add(CreateLauncherTile("🎮 NVIDIA Control Panel", "Tweak 3D settings, G-Sync & Max Frame Rates", () =>
@@ -3320,11 +5520,77 @@ namespace AspireSense
             }));
 
             tSp.Children.Add(utilGrid);
-            toolsCard.Child = tSp;
-            Grid.SetRow(toolsCard, 2);
-            g.Children.Add(toolsCard);
+            Border toolsCard = CreateSectionCard("Gaming Utilities & Acceleration", "Fast access to critical performance tools", tSp);
+            toolsCard.Margin = new Thickness(0, 8, 0, 0);
+            mainSp.Children.Add(toolsCard);
 
-            return g;
+            sv.Content = mainSp;
+            rootGrid.Children.Add(sv);
+            return rootGrid;
+        }
+
+        private Border CreatePillButton(string text, bool isActive, Action act)
+        {
+            Border b = new Border
+            {
+                Background = isActive ? DesignTokens.BrushBgCardActive : DesignTokens.BrushBgInput,
+                BorderBrush = isActive ? DesignTokens.BrushBorderFocus : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(10, 4, 10, 4),
+                Margin = new Thickness(0, 0, 5, 0),
+                Cursor = Cursors.Hand
+            };
+            TextBlock tb = new TextBlock
+            {
+                Text = text,
+                FontSize = 10,
+                FontWeight = isActive ? FontWeights.Bold : FontWeights.Normal,
+                Foreground = isActive ? Brushes.White : DesignTokens.BrushTextSecondary
+            };
+            b.Child = tb;
+
+            b.MouseEnter += (s, e) => {
+                if (b.BorderBrush != DesignTokens.BrushBorderFocus)
+                {
+                    b.Background = DesignTokens.BrushBgCardHover;
+                    tb.Foreground = DesignTokens.BrushTextPrimary;
+                }
+            };
+            b.MouseLeave += (s, e) => {
+                if (b.BorderBrush != DesignTokens.BrushBorderFocus)
+                {
+                    b.Background = DesignTokens.BrushBgInput;
+                    tb.Foreground = DesignTokens.BrushTextSecondary;
+                }
+            };
+
+            b.MouseDown += (s, e) => { act(); };
+            return b;
+        }
+
+        private Border CreateTelemetryPod(string title, Color accent)
+        {
+            Border b = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(14, 10, 14, 10),
+                Margin = new Thickness(4)
+            };
+            StackPanel sp = new StackPanel();
+            sp.Children.Add(new TextBlock
+            {
+                Text = title,
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(accent),
+                Margin = new Thickness(0, 0, 0, 4)
+            });
+            b.Tag = sp;
+            return b;
         }
 
         private void CheckPingAsync()
@@ -3369,16 +5635,16 @@ namespace AspireSense
             if (lblGamePing == null) return;
             if (rtt >= 0)
             {
-                string qual = (rtt < 40) ? "OPTIMAL LOW LATENCY" : ((rtt < 80) ? "GOOD" : "HIGH");
+                string qual = (rtt < 40) ? "Optimal low latency" : ((rtt < 80) ? "Good" : "High latency");
                 lblGamePing.Text = string.Format("{0} ms ({1})", rtt, qual);
-                if (rtt < 40) lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 140));
-                else if (rtt < 80) lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
-                else lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(255, 170, 0));
+                if (rtt < 40) lblGamePing.Foreground = DesignTokens.BrushAccentGreen;
+                else if (rtt < 80) lblGamePing.Foreground = DesignTokens.BrushAccentCyan;
+                else lblGamePing.Foreground = DesignTokens.BrushAccentAmber;
             }
             else
             {
-                lblGamePing.Text = "PING TIMEOUT / OFFLINE";
-                lblGamePing.Foreground = new SolidColorBrush(Color.FromRgb(255, 60, 60));
+                lblGamePing.Text = "Ping timeout / offline";
+                lblGamePing.Foreground = DesignTokens.BrushAccentRed;
             }
         }
 
@@ -3386,18 +5652,28 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(170, 18, 25, 42)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 160, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(12, 10, 12, 10),
-                Margin = new Thickness(5),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(14, 10, 14, 10),
+                Margin = new Thickness(4),
                 Cursor = Cursors.Hand
             };
             StackPanel sp = new StackPanel();
-            sp.Children.Add(new TextBlock { Text = title, FontSize = 12, FontWeight = FontWeights.Bold, Foreground = Brushes.White });
-            sp.Children.Add(new TextBlock { Text = desc, FontSize = 9.5, Foreground = Brushes.Silver, Margin = new Thickness(0, 3, 0, 0) });
+            sp.Children.Add(new TextBlock { Text = title, FontSize = 12, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary });
+            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10, Foreground = DesignTokens.BrushTextSecondary, Margin = new Thickness(0, 3, 0, 0) });
             b.Child = sp;
+
+            b.MouseEnter += (s, e) => {
+                b.Background = DesignTokens.BrushBgCardHover;
+                b.BorderBrush = DesignTokens.BrushBorderSubtleLight;
+            };
+            b.MouseLeave += (s, e) => {
+                b.Background = DesignTokens.BrushBgInput;
+                b.BorderBrush = DesignTokens.BrushBorderSubtle;
+            };
+
             b.MouseDown += (s, e) => { act(); };
             return b;
         }
@@ -3406,24 +5682,34 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(160, 15, 23, 40)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(70, 0, 140, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(8),
-                Padding = new Thickness(15, 12, 15, 12),
-                Margin = new Thickness(6),
+                Padding = new Thickness(14, 10, 14, 10),
+                Margin = new Thickness(5),
                 Cursor = Cursors.Hand
             };
             StackPanel sp = new StackPanel();
-            sp.Children.Add(new TextBlock { Text = title, FontSize = 13, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)) });
-            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10.5, Foreground = Brushes.Silver, Margin = new Thickness(0, 4, 0, 0) });
+            sp.Children.Add(new TextBlock { Text = title, FontSize = 12.5, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentCyan });
+            sp.Children.Add(new TextBlock { Text = desc, FontSize = 10, Foreground = DesignTokens.BrushTextSecondary, Margin = new Thickness(0, 4, 0, 0) });
             b.Child = sp;
+
+            b.MouseEnter += (s, e) => {
+                b.Background = DesignTokens.BrushBgCardHover;
+                b.BorderBrush = DesignTokens.BrushBorderSubtleLight;
+            };
+            b.MouseLeave += (s, e) => {
+                b.Background = DesignTokens.BrushBgInput;
+                b.BorderBrush = DesignTokens.BrushBorderSubtle;
+            };
+
             b.MouseDown += (s, e) => { act(); };
             return b;
         }
 
         // ==========================================
-        // PAGE 4: SYSTEM HEALTH & SPECS VIEW (MINIMALIST CYBERPUNK TELEMETRY)
+        // PAGE 4: SYSTEM HEALTH & SPECS VIEW
         // ==========================================
         private Grid CreateHealthView()
         {
@@ -3436,7 +5722,7 @@ namespace AspireSense
             Grid.SetRow(ribbon, 0);
             g.Children.Add(ribbon);
 
-            // 2. Lower Analytics Matrix (3 Equal Minimalist Glass Cards)
+            // 2. Lower Analytics Matrix (3 Equal Minimalist Cards)
             Grid lowerGrid = new Grid { Margin = new Thickness(0, 12, 0, 0) };
             lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -3467,9 +5753,9 @@ namespace AspireSense
         {
             Border ribbon = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(190, 10, 15, 26)),
+                Background = DesignTokens.BrushBgCard,
                 CornerRadius = new CornerRadius(10),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(50, 0, 180, 255)),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 Padding = new Thickness(14, 8, 14, 8)
             };
@@ -3477,12 +5763,12 @@ namespace AspireSense
             UniformGrid ug = new UniformGrid { Columns = 5 };
 
             TextBlock dummy;
-            ug.Children.Add(CreateRibbonTile("PROCESSOR MATRIX", HardwareBridge.ChassisCpuName, string.Format("{0} Cores • 4.8 GHz Max", Environment.ProcessorCount), out dummy));
-            ug.Children.Add(CreateRibbonTile("GRAPHICS SILICON", HardwareBridge.ChassisGpuName, "PCIe Gen 4.0 x8 Bus", out dummy));
+            ug.Children.Add(CreateRibbonTile("Processor", HardwareBridge.ChassisCpuName, string.Format("{0} Cores • 4.8 GHz Max", Environment.ProcessorCount), out dummy));
+            ug.Children.Add(CreateRibbonTile("Graphics Silicon", HardwareBridge.ChassisGpuName, "PCIe Gen 4.0 x8 Bus", out dummy));
             string ramDesc = string.Format("{0:F0} GB Dual-Channel", HardwareBridge.ChassisTotalRamGb > 0 ? HardwareBridge.ChassisTotalRamGb : 16.0);
-            ug.Children.Add(CreateRibbonTile("MEMORY ARCHITECTURE", ramDesc, "High-Speed Memory Bus", out dummy));
-            ug.Children.Add(CreateRibbonTile("FIRMWARE PLATFORM", HardwareBridge.ChassisBiosVersion, "EC Controller " + HardwareBridge.ChassisEcVersion, out dummy));
-            ug.Children.Add(CreateRibbonTile("SYSTEM RUNTIME", "0d 00h 00m 00s", HardwareBridge.ChassisOs, out lblHealthUptime));
+            ug.Children.Add(CreateRibbonTile("Memory Architecture", ramDesc, "High-Speed Memory Bus", out dummy));
+            ug.Children.Add(CreateRibbonTile("Firmware Platform", HardwareBridge.ChassisBiosVersion, "EC Controller " + HardwareBridge.ChassisEcVersion, out dummy));
+            ug.Children.Add(CreateRibbonTile("System Uptime", "0d 00h 00m 00s", HardwareBridge.ChassisOs, out lblHealthUptime));
 
             ribbon.Child = ug;
             return ribbon;
@@ -3492,7 +5778,9 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(90, 14, 20, 34)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
                 Padding = new Thickness(10, 7, 10, 7),
                 Margin = new Thickness(3)
@@ -3501,17 +5789,17 @@ namespace AspireSense
             sp.Children.Add(new TextBlock
             {
                 Text = category,
-                FontSize = 8.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(90, 140, 190))
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary
             });
 
             dynamicTb = new TextBlock
             {
                 Text = primary,
-                FontSize = 11.5,
+                FontSize = 12,
                 FontWeight = FontWeights.Bold,
-                Foreground = Brushes.White,
+                Foreground = DesignTokens.BrushTextPrimary,
                 Margin = new Thickness(0, 2, 0, 1),
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
@@ -3520,8 +5808,8 @@ namespace AspireSense
             sp.Children.Add(new TextBlock
             {
                 Text = secondary,
-                FontSize = 9,
-                Foreground = new SolidColorBrush(Color.FromRgb(130, 160, 190)),
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextMuted,
                 TextTrimming = TextTrimming.CharacterEllipsis
             });
 
@@ -3534,24 +5822,24 @@ namespace AspireSense
             StackPanel sp = new StackPanel();
 
             // VRAM Section
-            sp.Children.Add(CreateMetricHeader("VRAM DEDICATED ALLOCATION", out lblHealthVramText, "0.0 / 6.0 GB (0%)", Color.FromRgb(0, 229, 255)));
-            meterHealthVram = new SegmentedMeter(14, Color.FromRgb(0, 229, 255), 16, 5);
+            sp.Children.Add(CreateMetricHeader("VRAM Dedicated Allocation", out lblHealthVramText, "0.0 / 6.0 GB (0%)", DesignTokens.AccentCyan));
+            meterHealthVram = new SegmentedMeter(14, DesignTokens.AccentCyan, 16, 5);
             sp.Children.Add(meterHealthVram);
 
             // Clock Frequencies Dual Tile
             UniformGrid clkGrid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 14, 0, 12) };
-            clkGrid.Children.Add(CreateClockTile("CORE CLOCK", out lblHealthGpuCore, "2,130", "MHz"));
-            clkGrid.Children.Add(CreateClockTile("VRAM CLOCK", out lblHealthGpuMem, "8,001", "MHz"));
+            clkGrid.Children.Add(CreateClockTile("Core Clock", out lblHealthGpuCore, "2,130", "MHz"));
+            clkGrid.Children.Add(CreateClockTile("VRAM Clock", out lblHealthGpuMem, "8,001", "MHz"));
             sp.Children.Add(clkGrid);
 
             // Telemetry Status Lines
             StackPanel statSp = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
-            statSp.Children.Add(CreateStatusLine("THROTTLE REASON:", out lblHealthGpuThrottle, "OPTIMAL (IDLE)", Color.FromRgb(0, 255, 140)));
-            statSp.Children.Add(CreateStatusLine("THERMAL HEADROOM:", out lblHealthGpuHeadroom, "+48°C Margin (to 87°C)", Color.FromRgb(56, 189, 248)));
-            statSp.Children.Add(CreateStatusLine("BUS INTERFACE:", "PCIe Gen 4.0 x8 Active", Color.FromRgb(160, 190, 220)));
+            statSp.Children.Add(CreateStatusLine("Throttle Reason:", out lblHealthGpuThrottle, "Optimal (Idle)", DesignTokens.AccentGreen));
+            statSp.Children.Add(CreateStatusLine("Thermal Headroom:", out lblHealthGpuHeadroom, "+48°C Margin (to 87°C)", DesignTokens.AccentCyan));
+            statSp.Children.Add(CreateStatusLine("Bus Interface:", "PCIe Gen 4.0 x8 Active", DesignTokens.TextSecondaryColor));
             sp.Children.Add(statSp);
 
-            Border card = CreateMinimalCard("RTX 4050 ACCELERATOR", "AD107M", sp);
+            Border card = CreateMinimalCard("RTX 4050 Accelerator", "AD107M", sp);
             card.Margin = new Thickness(0, 0, 6, 0);
             return card;
         }
@@ -3561,17 +5849,17 @@ namespace AspireSense
             StackPanel sp = new StackPanel();
 
             // RAM Section
-            sp.Children.Add(CreateMetricHeader("PHYSICAL RAM UTILIZATION", out lblHealthRamText, "-- / -- GB (--%)", Color.FromRgb(168, 85, 247)));
-            meterHealthRam = new SegmentedMeter(14, Color.FromRgb(168, 85, 247), 16, 5);
+            sp.Children.Add(CreateMetricHeader("Physical RAM Utilization", out lblHealthRamText, "-- / -- GB (--%)", DesignTokens.AccentPurple));
+            meterHealthRam = new SegmentedMeter(14, DesignTokens.AccentPurple, 16, 5);
             sp.Children.Add(meterHealthRam);
 
             // Top Memory Consumers
             TextBlock topHeader = new TextBlock
             {
-                Text = "TOP ACTIVE CONSUMERS (RAM)",
-                FontSize = 8.5,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)),
+                Text = "Top Active Consumers (RAM)",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary,
                 Margin = new Thickness(0, 16, 0, 6)
             };
             sp.Children.Add(topHeader);
@@ -3581,18 +5869,18 @@ namespace AspireSense
             sp.Children.Add(CreateProcessItem("#3", out lblTopProc3));
 
             // Instant Purge Button
-            Border btnPurge = CreateActionButton("⚡ PURGE UNUSED MEMORY", () =>
+            Border btnPurge = CreateActionButton("⚡ Purge Unused Memory", () =>
             {
                 HardwareBridge.OptimizeMemory();
                 if (lblStatusMsg != null)
                 {
-                    lblStatusMsg.Text = "MEMORY PURGED: WORKING SETS TRIMMED SAFELY";
-                    lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 140));
+                    lblStatusMsg.Text = "Memory Purged: Working sets trimmed safely";
+                    lblStatusMsg.Foreground = DesignTokens.BrushAccentGreen;
                 }
             });
             sp.Children.Add(btnPurge);
 
-            Border card = CreateMinimalCard("MEMORY & PROCESSES", "32 GB DDR5", sp);
+            Border card = CreateMinimalCard("Memory & Processes", "32 GB DDR5", sp);
             card.Margin = new Thickness(3, 0, 3, 0);
             return card;
         }
@@ -3602,37 +5890,37 @@ namespace AspireSense
             StackPanel sp = new StackPanel();
 
             // Battery Section
-            sp.Children.Add(CreateMetricHeader("BATTERY POWER", out lblHealthBatteryText, "100% (AC Mains)", Color.FromRgb(0, 255, 140)));
-            meterHealthBattery = new SegmentedMeter(12, Color.FromRgb(0, 255, 140), 18, 5);
+            sp.Children.Add(CreateMetricHeader("Battery Power", out lblHealthBatteryText, "100% (AC Mains)", DesignTokens.AccentGreen));
+            meterHealthBattery = new SegmentedMeter(12, DesignTokens.AccentGreen, 18, 5);
             sp.Children.Add(meterHealthBattery);
 
             lblHealthBatteryWear = new TextBlock
             {
                 Text = "Design: 52.5 Wh | Current: 53.8 Wh (0.0% Wear)",
-                FontSize = 9.5,
-                Foreground = new SolidColorBrush(Color.FromRgb(130, 170, 200)),
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextSecondary,
                 Margin = new Thickness(0, 4, 0, 10)
             };
             sp.Children.Add(lblHealthBatteryWear);
 
             // Storage NVMe Section
-            sp.Children.Add(CreateMetricHeader("PRIMARY STORAGE (C: NVMe)", out lblHealthDiskText, "Checking capacity...", Color.FromRgb(0, 210, 255)));
-            meterHealthDisk = new SegmentedMeter(12, Color.FromRgb(0, 210, 255), 18, 5);
+            sp.Children.Add(CreateMetricHeader("Primary Storage (C: NVMe)", out lblHealthDiskText, "Checking capacity...", DesignTokens.AccentCyan));
+            meterHealthDisk = new SegmentedMeter(12, DesignTokens.AccentCyan, 18, 5);
             sp.Children.Add(meterHealthDisk);
 
             // CPU Headroom
             StackPanel statSp = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
-            statSp.Children.Add(CreateStatusLine("CPU SILICON HEADROOM:", out lblHealthCpuHeadroom, "+55°C Margin (to 100°C TJMax)", Color.FromRgb(0, 255, 140)));
+            statSp.Children.Add(CreateStatusLine("CPU Silicon Headroom:", out lblHealthCpuHeadroom, "+55°C Margin (to 100°C TJMax)", DesignTokens.AccentGreen));
             sp.Children.Add(statSp);
 
             // Export Diagnostics Button
-            Border btnExport = CreateActionButton("📋 COPY DIAGNOSTICS REPORT", () =>
+            Border btnExport = CreateActionButton("📋 Copy Diagnostics Report", () =>
             {
                 CopyDiagnosticsReport();
             });
             sp.Children.Add(btnExport);
 
-            Border card = CreateMinimalCard("POWER & STORAGE HEALTH", "OPTIMAL", sp);
+            Border card = CreateMinimalCard("Power & Storage Health", "Optimal", sp);
             card.Margin = new Thickness(6, 0, 0, 0);
             return card;
         }
@@ -3641,23 +5929,23 @@ namespace AspireSense
         {
             Border card = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(190, 10, 15, 26)),
+                Background = DesignTokens.BrushBgCard,
                 CornerRadius = new CornerRadius(10),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(50, 0, 180, 255)),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 Padding = new Thickness(16, 14, 16, 14)
             };
 
             Grid header = new Grid { Margin = new Thickness(0, 0, 0, 12) };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             TextBlock t = new TextBlock
             {
                 Text = title,
-                FontSize = 11.5,
+                FontSize = 12.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = Brushes.White,
+                Foreground = DesignTokens.BrushTextPrimary,
                 VerticalAlignment = VerticalAlignment.Center
             };
             Grid.SetColumn(t, 0);
@@ -3665,16 +5953,18 @@ namespace AspireSense
 
             Border bPill = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(80, 0, 140, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(6, 2, 6, 2)
+                Padding = new Thickness(8, 2, 8, 2)
             };
             bPill.Child = new TextBlock
             {
                 Text = badge,
-                FontSize = 9,
-                FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255))
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushAccentCyan
             };
             Grid.SetColumn(bPill, 1);
             header.Children.Add(bPill);
@@ -3691,13 +5981,13 @@ namespace AspireSense
         {
             Grid g = new Grid { Margin = new Thickness(0, 4, 0, 6) };
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            TextBlock lTb = new TextBlock { Text = label, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)), VerticalAlignment = VerticalAlignment.Center };
+            TextBlock lTb = new TextBlock { Text = label, FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(lTb, 0);
             g.Children.Add(lTb);
 
-            valTb = new TextBlock { Text = defaultVal, FontSize = 10.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
+            valTb = new TextBlock { Text = defaultVal, FontSize = 11, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(valTb, 1);
             g.Children.Add(valTb);
 
@@ -3708,20 +5998,20 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(110, 13, 19, 32)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(40, 0, 180, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
                 Padding = new Thickness(10, 8, 10, 8),
                 Margin = new Thickness(3)
             };
             StackPanel sp = new StackPanel();
-            sp.Children.Add(new TextBlock { Text = label, FontSize = 8.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 180)) });
+            sp.Children.Add(new TextBlock { Text = label, FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary });
 
             StackPanel numSp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 0) };
-            valTb = new TextBlock { Text = defVal, FontSize = 20, FontWeight = FontWeights.Black, Foreground = Brushes.White };
+            valTb = new TextBlock { Text = defVal, FontSize = 20, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushTextPrimary };
             numSp.Children.Add(valTb);
-            numSp.Children.Add(new TextBlock { Text = " " + unit, FontSize = 10, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)), VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 3) });
+            numSp.Children.Add(new TextBlock { Text = " " + unit, FontSize = 10.5, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushAccentCyan, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 3) });
             sp.Children.Add(numSp);
 
             b.Child = sp;
@@ -3731,14 +6021,14 @@ namespace AspireSense
         private Grid CreateStatusLine(string label, out TextBlock valTb, string defVal, Color valColor)
         {
             Grid g = new Grid { Margin = new Thickness(0, 3, 0, 3) };
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(125) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(135) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            TextBlock lTb = new TextBlock { Text = label, FontSize = 9, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(100, 140, 190)), VerticalAlignment = VerticalAlignment.Center };
+            TextBlock lTb = new TextBlock { Text = label, FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = DesignTokens.BrushTextSecondary, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(lTb, 0);
             g.Children.Add(lTb);
 
-            valTb = new TextBlock { Text = defVal, FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
+            valTb = new TextBlock { Text = defVal, FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(valColor), VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(valTb, 1);
             g.Children.Add(valTb);
 
@@ -3755,22 +6045,22 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(100, 14, 20, 32)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(30, 168, 85, 247)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(5),
                 Padding = new Thickness(10, 6, 10, 6),
                 Margin = new Thickness(0, 2, 0, 2)
             };
             Grid g = new Grid();
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(22) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            TextBlock rTb = new TextBlock { Text = rank, FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(168, 85, 247)), VerticalAlignment = VerticalAlignment.Center };
+            TextBlock rTb = new TextBlock { Text = rank, FontSize = 10, FontWeight = FontWeights.Bold, Foreground = DesignTokens.BrushAccentPurple, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(rTb, 0);
             g.Children.Add(rTb);
 
-            txt = new TextBlock { Text = "Analyzing...", FontSize = 10, FontWeight = FontWeights.SemiBold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
+            txt = new TextBlock { Text = "Analyzing...", FontSize = 10.5, FontWeight = FontWeights.Medium, Foreground = DesignTokens.BrushTextPrimary, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(txt, 1);
             g.Children.Add(txt);
 
@@ -3782,30 +6072,32 @@ namespace AspireSense
         {
             Border b = new Border
             {
-                Background = new SolidColorBrush(Color.FromArgb(140, 15, 22, 36)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(80, 0, 180, 255)),
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(12, 7, 12, 7),
+                Padding = new Thickness(12, 8, 12, 8),
                 Margin = new Thickness(0, 10, 0, 0),
                 Cursor = Cursors.Hand
             };
             TextBlock t = new TextBlock
             {
                 Text = label,
-                FontSize = 10,
+                FontSize = 10.5,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255)),
+                Foreground = DesignTokens.BrushAccentCyan,
                 HorizontalAlignment = HorizontalAlignment.Center
             };
             b.Child = t;
             b.MouseEnter += (s, e) => {
-                b.Background = new SolidColorBrush(Color.FromArgb(200, 0, 100, 200));
+                b.Background = DesignTokens.BrushBgCardHover;
+                b.BorderBrush = DesignTokens.BrushBorderSubtleLight;
                 t.Foreground = Brushes.White;
             };
             b.MouseLeave += (s, e) => {
-                b.Background = new SolidColorBrush(Color.FromArgb(140, 15, 22, 36));
-                t.Foreground = new SolidColorBrush(Color.FromRgb(0, 210, 255));
+                b.Background = DesignTokens.BrushBgInput;
+                b.BorderBrush = DesignTokens.BrushBorderSubtle;
+                t.Foreground = DesignTokens.BrushAccentCyan;
             };
             b.MouseDown += (s, e) => { action(); };
             return b;
@@ -3854,19 +6146,533 @@ namespace AspireSense
                 Clipboard.SetText(report);
                 if (lblStatusMsg != null)
                 {
-                    lblStatusMsg.Text = "DIAGNOSTIC REPORT COPIED TO CLIPBOARD";
-                    lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 140));
+                    lblStatusMsg.Text = "Diagnostic report copied to clipboard";
+                    lblStatusMsg.Foreground = DesignTokens.BrushAccentGreen;
                 }
             }
             catch (Exception ex)
             {
-                if (lblStatusMsg != null) lblStatusMsg.Text = "EXPORT ERROR: " + ex.Message;
+                if (lblStatusMsg != null) lblStatusMsg.Text = "Export error: " + ex.Message;
+            }
+        }
+
+        // ==========================================
+        // PAGE 5: EC ANTI-HALLUCINATION ARBITER VIEW
+        // ==========================================
+        private Grid CreateEcGuardView()
+        {
+            Grid g = new Grid { Margin = new Thickness(35, 12, 35, 12) };
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(88) }); // Top Ribbon: Live Analytics
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // 3 Analytics & Controls Cards
+
+            // 1. Top Ribbon: 5 Silicon & Acoustic Metrics
+            Border ribbon = CreateEcGuardRibbon();
+            Grid.SetRow(ribbon, 0);
+            g.Children.Add(ribbon);
+
+            // 2. Lower Grid: 3 Equal Cards
+            Grid lowerGrid = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            lowerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            // Card 1: Hysteresis & Clamp Settings (Manual Controls)
+            Border card1 = CreateEcSettingsCard();
+            Grid.SetColumn(card1, 0);
+            lowerGrid.Children.Add(card1);
+
+            // Card 2: Gaming Integration & Windows Turbo Tamer (Toggles & Optimizations)
+            Border card2 = CreateEcIntegrationCard();
+            Grid.SetColumn(card2, 1);
+            lowerGrid.Children.Add(card2);
+
+            // Card 3: Live Decision Stream & Telemetry Feed (Real-Time Decision Log)
+            Border card3 = CreateEcDecisionLogCard();
+            Grid.SetColumn(card3, 2);
+            lowerGrid.Children.Add(card3);
+
+            Grid.SetRow(lowerGrid, 1);
+            g.Children.Add(lowerGrid);
+
+            return g;
+        }
+
+        private Border CreateEcGuardRibbon()
+        {
+            Border ribbon = new Border
+            {
+                Background = DesignTokens.BrushBgCard,
+                CornerRadius = new CornerRadius(10),
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(14, 8, 14, 8)
+            };
+
+            UniformGrid ug = new UniformGrid { Columns = 5 };
+
+            ug.Children.Add(CreateRibbonTile("Silicon Die", "--°C", "Raw CPU Junction Reading", out lblEcRawDie));
+            ug.Children.Add(CreateRibbonTile("Heatsink EMA", "--°C", "Physical Thermal Mass EMA", out lblEcThermalEma));
+            ug.Children.Add(CreateRibbonTile("Spikes Blocked", "0 Spikes", "Jet-Fan Revs Suppressed", out lblEcSpikesCount));
+            ug.Children.Add(CreateRibbonTile("Acoustic Hold", "35% Duty", "Whisper-Quiet Floor", out lblEcAcousticHold));
+            ug.Children.Add(CreateRibbonTile("Arbiter Status", "Protected", "Live Classifier Decision", out lblEcClassifierState));
+
+            ribbon.Child = ug;
+            return ribbon;
+        }
+
+        private Border CreateEcSettingsCard()
+        {
+            StackPanel sp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+
+            // Master Toggle Button
+            btnEcMasterToggle = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(50, 16, 185, 129)),
+                BorderBrush = DesignTokens.BrushAccentGreen,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(14, 10, 14, 10),
+                Margin = new Thickness(0, 0, 0, 14),
+                Cursor = Cursors.Hand
+            };
+            lblEcMasterToggleText = new TextBlock
+            {
+                Text = "🛡️ EC Anti-Hallucination Guard: ENABLED",
+                FontSize = 11.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = Brushes.White,
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            btnEcMasterToggle.Child = lblEcMasterToggleText;
+            btnEcMasterToggle.MouseDown += (s, e) =>
+            {
+                EcAntiHallucinationEngine.Toggle();
+                UpdateDashboardEcGuardUi();
+            };
+            sp.Children.Add(btnEcMasterToggle);
+
+            // Group 1: Acoustic Clamp Ceiling
+            sp.Children.Add(new TextBlock
+            {
+                Text = "ACOUSTIC CLAMP CEILING (DESKTOP & BROWSING)",
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            UniformGrid clampGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 14) };
+            ecClampButtons.Clear();
+            ecClampButtons.Add(CreateEcSelectorPill("30% Silent", 30, EcAntiHallucinationEngine.AcousticClampDuty == 30, (val) => {
+                EcAntiHallucinationEngine.SetClampDuty(val);
+                UpdateEcSelectorPills(ecClampButtons, val);
+                UpdateDashboardEcGuardUi();
+            }));
+            ecClampButtons.Add(CreateEcSelectorPill("35% Quiet", 35, EcAntiHallucinationEngine.AcousticClampDuty == 35, (val) => {
+                EcAntiHallucinationEngine.SetClampDuty(val);
+                UpdateEcSelectorPills(ecClampButtons, val);
+                UpdateDashboardEcGuardUi();
+            }));
+            ecClampButtons.Add(CreateEcSelectorPill("40% Mod", 40, EcAntiHallucinationEngine.AcousticClampDuty == 40, (val) => {
+                EcAntiHallucinationEngine.SetClampDuty(val);
+                UpdateEcSelectorPills(ecClampButtons, val);
+                UpdateDashboardEcGuardUi();
+            }));
+            ecClampButtons.Add(CreateEcSelectorPill("45% Firm", 45, EcAntiHallucinationEngine.AcousticClampDuty == 45, (val) => {
+                EcAntiHallucinationEngine.SetClampDuty(val);
+                UpdateEcSelectorPills(ecClampButtons, val);
+                UpdateDashboardEcGuardUi();
+            }));
+            foreach (Border b in ecClampButtons) clampGrid.Children.Add(b);
+            sp.Children.Add(clampGrid);
+
+            // Group 2: Sustained Load Delay (Hysteresis Window)
+            sp.Children.Add(new TextBlock
+            {
+                Text = "SUSTAINED LOAD DELAY (HYSTERESIS WINDOW)",
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            UniformGrid hystGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 14) };
+            ecHysteresisButtons.Clear();
+            ecHysteresisButtons.Add(CreateEcSelectorPill("2 Seconds", 2, EcAntiHallucinationEngine.SustainedThresholdSeconds == 2, (val) => {
+                EcAntiHallucinationEngine.SetHysteresisSeconds(val);
+                UpdateEcSelectorPills(ecHysteresisButtons, val);
+            }));
+            ecHysteresisButtons.Add(CreateEcSelectorPill("3 Seconds", 3, EcAntiHallucinationEngine.SustainedThresholdSeconds == 3, (val) => {
+                EcAntiHallucinationEngine.SetHysteresisSeconds(val);
+                UpdateEcSelectorPills(ecHysteresisButtons, val);
+            }));
+            ecHysteresisButtons.Add(CreateEcSelectorPill("4s (Best)", 4, EcAntiHallucinationEngine.SustainedThresholdSeconds == 4, (val) => {
+                EcAntiHallucinationEngine.SetHysteresisSeconds(val);
+                UpdateEcSelectorPills(ecHysteresisButtons, val);
+            }));
+            ecHysteresisButtons.Add(CreateEcSelectorPill("6 Seconds", 6, EcAntiHallucinationEngine.SustainedThresholdSeconds == 6, (val) => {
+                EcAntiHallucinationEngine.SetHysteresisSeconds(val);
+                UpdateEcSelectorPills(ecHysteresisButtons, val);
+            }));
+            foreach (Border b in ecHysteresisButtons) hystGrid.Children.Add(b);
+            sp.Children.Add(hystGrid);
+
+            // Group 3: Emergency Failsafe Temperature
+            sp.Children.Add(new TextBlock
+            {
+                Text = "EMERGENCY SAFETY OVERRIDE (FAILSAFE TEMP)",
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 0, 0, 6)
+            });
+
+            UniformGrid failGrid = new UniformGrid { Columns = 4, Margin = new Thickness(0, 0, 0, 8) };
+            ecFailsafeButtons.Clear();
+            ecFailsafeButtons.Add(CreateEcSelectorPill("82°C", 82, EcAntiHallucinationEngine.FailsafeTemp == 82, (val) => {
+                EcAntiHallucinationEngine.SetFailsafeTemp(val);
+                UpdateEcSelectorPills(ecFailsafeButtons, val);
+            }));
+            ecFailsafeButtons.Add(CreateEcSelectorPill("85°C", 85, EcAntiHallucinationEngine.FailsafeTemp == 85, (val) => {
+                EcAntiHallucinationEngine.SetFailsafeTemp(val);
+                UpdateEcSelectorPills(ecFailsafeButtons, val);
+            }));
+            ecFailsafeButtons.Add(CreateEcSelectorPill("88°C (Best)", 88, EcAntiHallucinationEngine.FailsafeTemp == 88, (val) => {
+                EcAntiHallucinationEngine.SetFailsafeTemp(val);
+                UpdateEcSelectorPills(ecFailsafeButtons, val);
+            }));
+            ecFailsafeButtons.Add(CreateEcSelectorPill("92°C", 92, EcAntiHallucinationEngine.FailsafeTemp == 92, (val) => {
+                EcAntiHallucinationEngine.SetFailsafeTemp(val);
+                UpdateEcSelectorPills(ecFailsafeButtons, val);
+            }));
+            foreach (Border b in ecFailsafeButtons) failGrid.Children.Add(b);
+            sp.Children.Add(failGrid);
+
+            return CreateSectionCard("Hysteresis & Acoustic Settings", "Manual control over EC interception and delay windows", sp);
+        }
+
+        private Border CreateEcIntegrationCard()
+        {
+            StackPanel sp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+
+            // 1. DirectX Zero-Hook Gaming Auto-Detection
+            btnEcGameToggle = new Border
+            {
+                Background = EcAntiHallucinationEngine.AutoUnclampGaming ? new SolidColorBrush(Color.FromArgb(40, 0, 122, 255)) : DesignTokens.BrushBgInput,
+                BorderBrush = EcAntiHallucinationEngine.AutoUnclampGaming ? DesignTokens.BrushAccentBlue : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12, 8, 12, 8),
+                Margin = new Thickness(0, 0, 0, 12),
+                Cursor = Cursors.Hand
+            };
+            StackPanel gSp = new StackPanel();
+            lblEcGameToggleText = new TextBlock
+            {
+                Text = EcAntiHallucinationEngine.AutoUnclampGaming ? "🎮 3D Game Detection: ON (Auto-Unclamp)" : "🎮 3D Game Detection: OFF",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = EcAntiHallucinationEngine.AutoUnclampGaming ? DesignTokens.BrushAccentBlue : DesignTokens.BrushTextSecondary
+            };
+            gSp.Children.Add(lblEcGameToggleText);
+            gSp.Children.Add(new TextBlock
+            {
+                Text = "Releases acoustic clamps the moment DirectX/Vulkan 3D frames begin via ETW.",
+                FontSize = 9.5,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 2, 0, 0)
+            });
+            btnEcGameToggle.Child = gSp;
+            btnEcGameToggle.MouseDown += (s, e) =>
+            {
+                EcAntiHallucinationEngine.AutoUnclampGaming = !EcAntiHallucinationEngine.AutoUnclampGaming;
+                lblEcGameToggleText.Text = EcAntiHallucinationEngine.AutoUnclampGaming ? "🎮 3D Game Detection: ON (Auto-Unclamp)" : "🎮 3D Game Detection: OFF";
+                lblEcGameToggleText.Foreground = EcAntiHallucinationEngine.AutoUnclampGaming ? DesignTokens.BrushAccentBlue : DesignTokens.BrushTextSecondary;
+                btnEcGameToggle.Background = EcAntiHallucinationEngine.AutoUnclampGaming ? new SolidColorBrush(Color.FromArgb(40, 0, 122, 255)) : DesignTokens.BrushBgInput;
+                btnEcGameToggle.BorderBrush = EcAntiHallucinationEngine.AutoUnclampGaming ? DesignTokens.BrushAccentBlue : DesignTokens.BrushBorderSubtle;
+                EcAntiHallucinationEngine.LogDecision("CONFIG: Game auto-detection set to " + (EcAntiHallucinationEngine.AutoUnclampGaming ? "ON" : "OFF"));
+            };
+            sp.Children.Add(btnEcGameToggle);
+
+            // 2. Windows CPU Boost Tamer (99% State)
+            btnEcBoostTamer = new Border
+            {
+                Background = EcAntiHallucinationEngine.PowerBoostTamed ? new SolidColorBrush(Color.FromArgb(40, 16, 185, 129)) : DesignTokens.BrushBgInput,
+                BorderBrush = EcAntiHallucinationEngine.PowerBoostTamed ? DesignTokens.BrushAccentGreen : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12, 8, 12, 8),
+                Margin = new Thickness(0, 0, 0, 12),
+                Cursor = Cursors.Hand
+            };
+            StackPanel bSp = new StackPanel();
+            lblEcBoostTamerText = new TextBlock
+            {
+                Text = EcAntiHallucinationEngine.PowerBoostTamed ? "⚡ CPU Turbo Spikes: TAMED (99% Mode)" : "⚡ CPU Turbo Spikes: DEFAULT (100% Boost)",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = EcAntiHallucinationEngine.PowerBoostTamed ? DesignTokens.BrushAccentGreen : DesignTokens.BrushTextSecondary
+            };
+            bSp.Children.Add(lblEcBoostTamerText);
+            lblEcBoostTamerStatus = new TextBlock
+            {
+                Text = EcAntiHallucinationEngine.PowerBoostTamed ? "Micro-burst turbo overvolt eliminated. 100% base clock speed preserved." : "Windows Balanced: Aggressive turbo burst enabled.",
+                FontSize = 9.5,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            bSp.Children.Add(lblEcBoostTamerStatus);
+            btnEcBoostTamer.Child = bSp;
+            btnEcBoostTamer.MouseDown += (s, e) =>
+            {
+                EcAntiHallucinationEngine.TogglePowerBoostTamer();
+                lblEcBoostTamerText.Text = EcAntiHallucinationEngine.PowerBoostTamed ? "⚡ CPU Turbo Spikes: TAMED (99% Mode)" : "⚡ CPU Turbo Spikes: DEFAULT (100% Boost)";
+                lblEcBoostTamerText.Foreground = EcAntiHallucinationEngine.PowerBoostTamed ? DesignTokens.BrushAccentGreen : DesignTokens.BrushTextSecondary;
+                lblEcBoostTamerStatus.Text = EcAntiHallucinationEngine.PowerBoostTamed ? "Micro-burst turbo overvolt eliminated. 100% base clock speed preserved." : "Windows Balanced: Aggressive turbo burst enabled.";
+                btnEcBoostTamer.Background = EcAntiHallucinationEngine.PowerBoostTamed ? new SolidColorBrush(Color.FromArgb(40, 16, 185, 129)) : DesignTokens.BrushBgInput;
+                btnEcBoostTamer.BorderBrush = EcAntiHallucinationEngine.PowerBoostTamed ? DesignTokens.BrushAccentGreen : DesignTokens.BrushBorderSubtle;
+            };
+            sp.Children.Add(btnEcBoostTamer);
+
+            // 3. Heatsink Thermal Saturation Bar
+            lblHeatsinkSatText = new TextBlock
+            {
+                Text = "Heatsink Thermal Saturation: --% (--°C EMA)",
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = DesignTokens.BrushTextSecondary,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            sp.Children.Add(lblHeatsinkSatText);
+
+            meterHeatsinkSaturation = new SegmentedMeter(10, DesignTokens.AccentCyan, 28, 4);
+            meterHeatsinkSaturation.Margin = new Thickness(0, 0, 0, 12);
+            sp.Children.Add(meterHeatsinkSaturation);
+
+            // 4. One-Click EC Hardware Reset
+            Border btnResetEc = CreateActionButton("🔄 Reload Baseline EC Hardware Registers", () =>
+            {
+                HardwareBridge.ResetToAuto();
+                EcAntiHallucinationEngine.LogDecision("EC RESET: Reloaded factory EC baseline firmware tables");
+                if (lblStatusMsg != null)
+                {
+                    lblStatusMsg.Text = "EC registers reset to factory baseline";
+                    lblStatusMsg.Foreground = DesignTokens.BrushAccentGreen;
+                }
+            });
+            sp.Children.Add(btnResetEc);
+
+            return CreateSectionCard("Gaming & Silicon Integration", "Zero-hook ETW detection, CPU overvolt tamer, and EC reset", sp);
+        }
+
+        private Border CreateEcDecisionLogCard()
+        {
+            StackPanel sp = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+
+            Border logBox = new Border
+            {
+                Background = DesignTokens.BrushBgInput,
+                BorderBrush = DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(10),
+                Height = 220
+            };
+
+            ScrollViewer sv = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+
+            txtDecisionLog = new TextBlock
+            {
+                Text = "Initializing Decision Stream...",
+                FontSize = 9.5,
+                FontFamily = new FontFamily("Consolas, Courier New"),
+                Foreground = DesignTokens.BrushTextSecondary,
+                TextWrapping = TextWrapping.Wrap
+            };
+            sv.Content = txtDecisionLog;
+            logBox.Child = sv;
+            sp.Children.Add(logBox);
+
+            UniformGrid btnGrid = new UniformGrid { Columns = 2, Margin = new Thickness(0, 10, 0, 0) };
+
+            Border btnClear = CreateActionButton("Clear Log", () =>
+            {
+                EcAntiHallucinationEngine.ClearLogs();
+                if (txtDecisionLog != null) txtDecisionLog.Text = "Decision stream cleared by user";
+            });
+            btnGrid.Children.Add(btnClear);
+
+            Border btnCopy = CreateActionButton("Copy Stream", () =>
+            {
+                try
+                {
+                    Clipboard.SetText(string.Join("\n", EcAntiHallucinationEngine.GetRecentLogs(50).ToArray()));
+                    if (lblStatusMsg != null)
+                    {
+                        lblStatusMsg.Text = "Decision stream copied to clipboard";
+                        lblStatusMsg.Foreground = DesignTokens.BrushAccentGreen;
+                    }
+                }
+                catch { }
+            });
+            btnGrid.Children.Add(btnCopy);
+
+            sp.Children.Add(btnGrid);
+
+            return CreateSectionCard("Decision Stream & Telemetry Log", "Real-time classifier state, spike interceptions, and EC commands", sp);
+        }
+
+        private Border CreateEcSelectorPill(string label, int value, bool isSelected, Action<int> onClick)
+        {
+            Border b = new Border
+            {
+                Background = isSelected ? DesignTokens.BrushAccentBlue : DesignTokens.BrushBgInput,
+                BorderBrush = isSelected ? DesignTokens.BrushAccentBlue : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(4, 6, 4, 6),
+                Margin = new Thickness(2),
+                Cursor = Cursors.Hand,
+                Tag = value
+            };
+
+            TextBlock tb = new TextBlock
+            {
+                Text = label,
+                FontSize = 9.5,
+                FontWeight = isSelected ? FontWeights.Bold : FontWeights.SemiBold,
+                Foreground = isSelected ? Brushes.White : DesignTokens.BrushTextSecondary,
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            b.Child = tb;
+
+            b.MouseDown += (s, e) => { onClick(value); };
+            return b;
+        }
+
+        private void UpdateEcSelectorPills(List<Border> pills, int selectedVal)
+        {
+            foreach (Border b in pills)
+            {
+                if (b.Tag != null && (int)b.Tag == selectedVal)
+                {
+                    b.Background = DesignTokens.BrushAccentBlue;
+                    b.BorderBrush = DesignTokens.BrushAccentBlue;
+                    TextBlock tb = b.Child as TextBlock;
+                    if (tb != null)
+                    {
+                        tb.Foreground = Brushes.White;
+                        tb.FontWeight = FontWeights.Bold;
+                    }
+                }
+                else
+                {
+                    b.Background = DesignTokens.BrushBgInput;
+                    b.BorderBrush = DesignTokens.BrushBorderSubtle;
+                    TextBlock tb = b.Child as TextBlock;
+                    if (tb != null)
+                    {
+                        tb.Foreground = DesignTokens.BrushTextSecondary;
+                        tb.FontWeight = FontWeights.SemiBold;
+                    }
+                }
+            }
+        }
+
+        private void UpdateDashboardEcGuardUi()
+        {
+            bool enabled = EcAntiHallucinationEngine.IsEnabled;
+            if (lblDashboardEcGuardIndicator != null)
+            {
+                lblDashboardEcGuardIndicator.Text = enabled ? "🛡️ EC Guard: ACTIVE" : "⚪ EC Guard: DISABLED";
+                lblDashboardEcGuardIndicator.Foreground = enabled ? DesignTokens.BrushAccentGreen : DesignTokens.BrushTextMuted;
+            }
+            if (lblDashboardEcGuardStatus != null)
+            {
+                if (!enabled)
+                {
+                    lblDashboardEcGuardStatus.Text = "Raw EC Control (No Interception)";
+                    lblDashboardEcGuardStatus.Foreground = DesignTokens.BrushTextMuted;
+                }
+                else if (EcAntiHallucinationEngine.IsCurrentlyClamped)
+                {
+                    lblDashboardEcGuardStatus.Text = "Silent Mode (Anti-Revving Active)";
+                    lblDashboardEcGuardStatus.Foreground = DesignTokens.BrushAccentCyan;
+                }
+                else
+                {
+                    lblDashboardEcGuardStatus.Text = "Cooling Released";
+                    lblDashboardEcGuardStatus.Foreground = DesignTokens.BrushAccentAmber;
+                }
+            }
+            if (btnToolEcGuard != null)
+            {
+                TextBlock tb = btnToolEcGuard.Child as TextBlock;
+                if (tb != null)
+                {
+                    tb.Text = enabled ? "🛡️ EC Guard: ON" : "⚪ EC Guard: OFF";
+                    tb.Foreground = enabled ? DesignTokens.BrushAccentGreen : DesignTokens.BrushTextSecondary;
+                }
+            }
+            if (btnEcMasterToggle != null && lblEcMasterToggleText != null)
+            {
+                btnEcMasterToggle.Background = enabled ? new SolidColorBrush(Color.FromArgb(50, 16, 185, 129)) : DesignTokens.BrushBgInput;
+                btnEcMasterToggle.BorderBrush = enabled ? DesignTokens.BrushAccentGreen : DesignTokens.BrushBorderSubtle;
+                lblEcMasterToggleText.Text = enabled ? "🛡️ EC Anti-Hallucination Guard: ENABLED" : "⚪ EC Anti-Hallucination Guard: DISABLED";
+                lblEcMasterToggleText.Foreground = enabled ? Brushes.White : DesignTokens.BrushTextSecondary;
+            }
+        }
+
+        private void UpdateEcGuardView(HardwareBridge.SensorData d)
+        {
+            if (lblEcRawDie != null)
+            {
+                lblEcRawDie.Text = string.Format("{0}°C", d.CpuTemp);
+                if (d.CpuTemp >= 80) lblEcRawDie.Foreground = DesignTokens.BrushAccentRed;
+                else if (d.CpuTemp >= 68) lblEcRawDie.Foreground = DesignTokens.BrushAccentAmber;
+                else lblEcRawDie.Foreground = DesignTokens.BrushTextPrimary;
+            }
+            if (lblEcThermalEma != null)
+            {
+                lblEcThermalEma.Text = string.Format("{0:F1}°C", EcAntiHallucinationEngine.FilteredThermalEma);
+            }
+            if (lblEcSpikesCount != null)
+            {
+                lblEcSpikesCount.Text = string.Format("{0} Spikes", EcAntiHallucinationEngine.InterceptedSpikeCount);
+            }
+            if (lblEcAcousticHold != null)
+            {
+                lblEcAcousticHold.Text = EcAntiHallucinationEngine.IsCurrentlyClamped 
+                    ? string.Format("{0}% Duty", EcAntiHallucinationEngine.AcousticClampDuty)
+                    : "Released";
+                lblEcAcousticHold.Foreground = EcAntiHallucinationEngine.IsCurrentlyClamped 
+                    ? DesignTokens.BrushAccentGreen 
+                    : DesignTokens.BrushAccentAmber;
+            }
+            if (lblEcClassifierState != null)
+            {
+                lblEcClassifierState.Text = EcAntiHallucinationEngine.CurrentClassifierState;
+            }
+            if (meterHeatsinkSaturation != null && lblHeatsinkSatText != null)
+            {
+                meterHeatsinkSaturation.SetValue(EcAntiHallucinationEngine.HeatsinkSaturationPct);
+                lblHeatsinkSatText.Text = string.Format("Heatsink Thermal Saturation: {0:F0}% ({1:F1}°C EMA)", 
+                    EcAntiHallucinationEngine.HeatsinkSaturationPct, EcAntiHallucinationEngine.FilteredThermalEma);
+            }
+            if (txtDecisionLog != null)
+            {
+                List<string> logs = EcAntiHallucinationEngine.GetRecentLogs(10);
+                txtDecisionLog.Text = string.Join("\n", logs.ToArray());
             }
         }
 
         private Grid CreateFooter()
         {
-            Grid f = new Grid { Background = new SolidColorBrush(Color.FromRgb(8, 11, 20)) };
+            Grid f = new Grid { Background = DesignTokens.BrushBgWindow };
             f.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             f.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(350) });
 
@@ -3876,23 +6682,23 @@ namespace AspireSense
             {
                 case HardwareVendor.Asus:
                     archInfo = string.Format("AspireSense 2026 | {0} | ASUS Direct ACPI Hardware Engine Active", HardwareBridge.ChassisModel);
-                    statusInfo = "Status: ASUS Direct ACPI (Independent of Armoury Crate)";
+                    statusInfo = "Status: ASUS Direct ACPI Active";
                     break;
                 case HardwareVendor.Lenovo:
                     archInfo = string.Format("AspireSense 2026 | {0} | Lenovo Vantage EC / WMI Engine Active", HardwareBridge.ChassisModel);
-                    statusInfo = "Status: Lenovo WMI Interface (Independent of Vantage)";
+                    statusInfo = "Status: Lenovo WMI Interface Active";
                     break;
                 case HardwareVendor.Hp:
                     archInfo = string.Format("AspireSense 2026 | {0} | HP Omen / Victus BIOS WMI Active", HardwareBridge.ChassisModel);
-                    statusInfo = "Status: HP WMI Interface (Independent of OMEN Gaming Hub)";
+                    statusInfo = "Status: HP WMI Interface Active";
                     break;
                 case HardwareVendor.Dell:
                     archInfo = string.Format("AspireSense 2026 | {0} | Dell Alienware / G-Series WMAX Active", HardwareBridge.ChassisModel);
-                    statusInfo = "Status: Dell WMAX Interface (Independent of AWCC)";
+                    statusInfo = "Status: Dell WMAX Interface Active";
                     break;
                 case HardwareVendor.Acer:
                     archInfo = string.Format("AspireSense 2026 | {0} | Acer Standalone EC Engine Active", HardwareBridge.ChassisModel);
-                    statusInfo = "Status: Fully Standalone (Independent of Care Center / NitroSense)";
+                    statusInfo = "Status: Standalone EC Active";
                     break;
                 default:
                     archInfo = string.Format("AspireSense 2026 | {0} | Universal Telemetry Engine Active", HardwareBridge.ChassisModel);
@@ -3903,8 +6709,8 @@ namespace AspireSense
             TextBlock info = new TextBlock
             {
                 Text = archInfo,
-                FontSize = 9.5,
-                Foreground = new SolidColorBrush(Color.FromRgb(100, 130, 170)),
+                FontSize = 10,
+                Foreground = DesignTokens.BrushTextSecondary,
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(30, 0, 0, 0)
             };
@@ -3914,9 +6720,9 @@ namespace AspireSense
             TextBlock stat = new TextBlock
             {
                 Text = statusInfo,
-                FontSize = 9.5,
+                FontSize = 10,
                 FontWeight = FontWeights.Bold,
-                Foreground = new SolidColorBrush(Color.FromRgb(0, 200, 140)),
+                Foreground = DesignTokens.BrushAccentGreen,
                 VerticalAlignment = VerticalAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Right,
                 Margin = new Thickness(0, 0, 30, 0)
@@ -3925,6 +6731,87 @@ namespace AspireSense
             f.Children.Add(stat);
 
             return f;
+        }
+
+        private void OverlayTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                GameTelemetryEngine.UpdateMetrics();
+
+                double fps = GameTelemetryEngine.CurrentFps;
+                double avgFps = GameTelemetryEngine.AvgFps;
+                double oneLow = GameTelemetryEngine.OnePercentLowFps;
+                double frameTime = GameTelemetryEngine.CurrentFrameTimeMs;
+                string target = GameTelemetryEngine.ActiveProcessName;
+
+                int gpuT = (latestSensorData != null) ? latestSensorData.GpuTemp : 0;
+                float gpuU = (latestSensorData != null) ? latestSensorData.GpuUsage : 0f;
+                float gpuW = (latestSensorData != null) ? latestSensorData.GpuWatts : 0f;
+                int cpuT = (latestSensorData != null) ? latestSensorData.CpuTemp : 0;
+                float cpuU = (latestSensorData != null) ? latestSensorData.CpuUsage : 0f;
+                float cpuW = (latestSensorData != null) ? latestSensorData.CpuWatts : 0f;
+                double ramUsed = (latestSensorData != null) ? latestSensorData.UsedRamGb : 0.0;
+                double ramTot = (latestSensorData != null) ? latestSensorData.TotalRamGb : 16.0;
+                float ramPct = (latestSensorData != null) ? latestSensorData.RamUsage : 0f;
+
+                if (overlayWindow != null && isOverlayActive)
+                {
+                    overlayWindow.UpdateMetrics(fps, avgFps, oneLow, gpuT, gpuU, gpuW, cpuT, cpuU, cpuW, ramUsed, ramPct, target);
+                }
+
+                if (viewGaming != null && viewGaming.Visibility == Visibility.Visible)
+                {
+                    if (lblHubFpsVal != null)
+                    {
+                        lblHubFpsVal.Text = (fps > 0) ? string.Format("{0:F0} FPS", fps) : "-- FPS";
+                        lblHubFpsVal.Foreground = (fps >= 60)
+                            ? new SolidColorBrush(Color.FromRgb(0, 255, 140))
+                            : ((fps >= 30) ? new SolidColorBrush(Color.FromRgb(0, 210, 255)) : new SolidColorBrush(Color.FromRgb(255, 42, 85)));
+                    }
+                    if (lblHubOneLowVal != null)
+                    {
+                        lblHubOneLowVal.Text = (fps > 0) ? string.Format("AVG: {0:F0} | 1% LOW: {1:F0} FPS", avgFps > 0 ? avgFps : fps, oneLow) : "AVG: -- | 1% LOW: -- FPS";
+                        lblHubOneLowVal.Foreground = (oneLow >= 45) ? new SolidColorBrush(Color.FromRgb(0, 229, 255)) : new SolidColorBrush(Color.FromRgb(255, 170, 0));
+                    }
+                    if (lblHubFrameTimeVal != null)
+                    {
+                        lblHubFrameTimeVal.Text = (frameTime > 0) ? string.Format("{0:F1} ms Delivery Latency", frameTime) : "-- ms Delivery Latency";
+                    }
+                    if (meterHubStability != null)
+                    {
+                        double stab = (fps > 0) ? Math.Min(100.0, (oneLow / fps) * 100.0) : 0.0;
+                        meterHubStability.SetValue(stab);
+                    }
+                    if (lblHubGpuVal != null)
+                    {
+                        lblHubGpuVal.Text = string.Format("{0}°C | {1:F0}% | {2:F0}W", gpuT, gpuU, gpuW);
+                    }
+                    if (meterHubGpu != null) meterHubGpu.SetValue(gpuU);
+
+                    if (lblHubCpuVal != null)
+                    {
+                        lblHubCpuVal.Text = string.Format("{0}°C | {1:F0}% | {2:F0}W", cpuT, cpuU, cpuW);
+                    }
+                    if (meterHubCpu != null) meterHubCpu.SetValue(cpuU);
+
+                    if (lblHubRamVal != null)
+                    {
+                        lblHubRamVal.Text = string.Format("{0:F1} / {1:F1} GB ({2:F0}%)", ramUsed, ramTot, ramPct);
+                    }
+                    if (meterHubRam != null) meterHubRam.SetValue(ramPct);
+
+                    if (lblHubTargetApp != null)
+                    {
+                        lblHubTargetApp.Text = string.Format("ACTIVE TARGET: {0}", target);
+                    }
+                    if (lblHubEngineStatus != null)
+                    {
+                        lblHubEngineStatus.Text = GameTelemetryEngine.IsEtwActive ? "⚡ ZERO-HOOK ETW DIRECTX ACTIVE" : "📊 DWM TELEMETRY ACTIVE";
+                    }
+                }
+            }
+            catch { }
         }
 
         private void Timer_Tick(object sender, EventArgs e)
@@ -3968,14 +6855,38 @@ namespace AspireSense
                     CheckPingAsync();
                 }
 
-                // 3. Update Dashboard Speedometers
+                // 3. Update Dashboard Telemetry Rings & Control Center
                 if (cpuSpeedo != null)
                 {
-                    cpuSpeedo.Update(d.CpuUsage, d.CpuTemp, d.CpuRpm, d.CpuDuty);
+                    cpuSpeedo.Update(d.CpuUsage, d.CpuTemp, d.CpuRpm, d.CpuDuty, d.CpuWatts);
                 }
                 if (gpuSpeedo != null)
                 {
-                    gpuSpeedo.Update(d.GpuUsage, d.GpuTemp, d.GpuRpm, d.GpuDuty);
+                    gpuSpeedo.Update(d.GpuUsage, d.GpuTemp, d.GpuRpm, d.GpuDuty, d.GpuWatts);
+                }
+                if (lblDiagPower != null)
+                {
+                    lblDiagPower.Text = d.IsAcPlugged ? "⚡ AC Power" : string.Format("🔋 Bat ({0}%)", d.BatteryPercent);
+                }
+                if (lblDiagBattery != null)
+                {
+                    lblDiagBattery.Text = (d.BatteryHealthPct > 0) ? string.Format("🛡️ {0:F0}% Health", d.BatteryHealthPct) : "🛡️ Battery OK";
+                }
+                if (lblDiagUptime != null)
+                {
+                    lblDiagUptime.Text = string.Format("⏱️ {0:h\\:mm} Uptime", d.SystemUptime);
+                }
+
+                // 3b. Update EC Anti-Hallucination Arbiter Engine
+                if (currentFanMode != 1 && heatFlushRemaining == 0)
+                {
+                    EcAntiHallucinationEngine.Update(d.CpuTemp, d.GpuTemp, d.CpuUsage, d.GpuUsage, d.CpuWatts, GameTelemetryEngine.IsEtwActive);
+                }
+                UpdateDashboardEcGuardUi();
+
+                if (viewEcGuard != null && viewEcGuard.Visibility == Visibility.Visible)
+                {
+                    UpdateEcGuardView(d);
                 }
 
                 // 4. Update Cooling View Blowers & Meters
@@ -4106,12 +7017,16 @@ namespace AspireSense
                     catch { }
                 }
 
-                // ACTIVE THERMAL WATCHDOG: Safeguard hardware against excessive temperatures
-                if (d.CpuTemp >= 90 || d.GpuTemp >= 85)
+                // ACTIVE THERMAL WATCHDOG: Safeguard hardware against sustained excessive temperatures with auto-recovery
+                bool isSustainedHighHeat = (d.CpuTemp >= 92 || d.GpuTemp >= 86);
+                if (isSustainedHighHeat && (currentFanMode == 3 || (currentFanMode == 6 && currentCustomDuty < 80)))
                 {
-                    if (currentFanMode == 3 || (currentFanMode == 6 && currentCustomDuty < 80))
+                    watchdogHighHeatCount++;
+                    watchdogCoolCount = 0;
+                    if (watchdogHighHeatCount >= 4 && !watchdogActive) // Must sustain 4+ consecutive seconds (prevents false triggers on browser spikes)
                     {
-                        // High heat detected while fan is constrained -> automatically engage Turbo cooling!
+                        watchdogActive = true;
+                        watchdogPreviousMode = currentFanMode;
                         HardwareBridge.SetFanMode(1);
                         currentFanMode = 1;
                         if (lblStatusMsg != null)
@@ -4122,6 +7037,35 @@ namespace AspireSense
                         UpdateDriveModeButton(btnMax, true, Color.FromRgb(255, 30, 86));
                         UpdateDriveModeButton(btnAuto, false, Color.FromRgb(0, 144, 255));
                         UpdateDriveModeButton(btnQuiet, false, Color.FromRgb(0, 229, 255));
+                    }
+                }
+                else
+                {
+                    watchdogHighHeatCount = 0;
+                    // Auto-recovery: Once hardware cools down safely (<= 75°C CPU, <= 70°C GPU) for 5 seconds, restore normal mode!
+                    if (watchdogActive && d.CpuTemp <= 75 && d.GpuTemp <= 70)
+                    {
+                        watchdogCoolCount++;
+                        if (watchdogCoolCount >= 5)
+                        {
+                            watchdogActive = false;
+                            watchdogCoolCount = 0;
+                            int restoreMode = (watchdogPreviousMode == 3) ? 3 : 0;
+                            HardwareBridge.SetFanMode(restoreMode);
+                            currentFanMode = restoreMode;
+                            if (lblStatusMsg != null)
+                            {
+                                lblStatusMsg.Text = (restoreMode == 3) ? "QUIET (TEMPERATURE NORMALIZED)" : "DYNAMIC AUTO (TEMPERATURE NORMALIZED)";
+                                lblStatusMsg.Foreground = new SolidColorBrush(Color.FromRgb(0, 225, 255));
+                            }
+                            UpdateDriveModeButton(btnAuto, restoreMode == 0, Color.FromRgb(0, 144, 255));
+                            UpdateDriveModeButton(btnQuiet, restoreMode == 3, Color.FromRgb(0, 229, 255));
+                            UpdateDriveModeButton(btnMax, false, Color.FromRgb(255, 30, 86));
+                        }
+                    }
+                    else
+                    {
+                        watchdogCoolCount = 0;
                     }
                 }
             }

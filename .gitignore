@@ -10,4 +10,6 @@ obj/
 # Release binary archives (uploaded to GitHub Releases)
 *.zip
 *-Setup.exe
+*_old*.exe
+AspireSense_old*.exe
 
