@@ -511,15 +511,15 @@ namespace AspireSense
             UniformGrid utilGrid = new UniformGrid { Columns = 2 };
             utilGrid.Children.Add(CreateLauncherTile("🎮 NVIDIA Control Panel", "Tweak 3D settings, G-Sync & Max Frame Rates", () =>
             {
-                try { Process.Start("control.exe", "/name Microsoft.NvidiaControlPanel"); } catch { }
+                try { Process.Start(System.IO.Path.Combine(Environment.SystemDirectory, "control.exe"), "/name Microsoft.NvidiaControlPanel"); } catch { }
             }));
             utilGrid.Children.Add(CreateLauncherTile("📊 Windows Task Manager", "Inspect process execution & background tasks", () =>
             {
-                try { Process.Start("taskmgr.exe"); } catch { }
+                try { Process.Start(System.IO.Path.Combine(Environment.SystemDirectory, "taskmgr.exe")); } catch { }
             }));
             utilGrid.Children.Add(CreateLauncherTile("🎯 DirectX Diagnostics (DxDiag)", "View direct 3D hardware & display driver specs", () =>
             {
-                try { Process.Start("dxdiag.exe"); } catch { }
+                try { Process.Start(System.IO.Path.Combine(Environment.SystemDirectory, "dxdiag.exe")); } catch { }
             }));
             utilGrid.Children.Add(CreateLauncherTile("⚡ Windows Power & Battery", "Adjust screen sleep and power management", () =>
             {
@@ -531,7 +531,7 @@ namespace AspireSense
             }));
             utilGrid.Children.Add(CreateLauncherTile("📁 AspireSense Folder", "Open application install location & logs", () =>
             {
-                try { Process.Start("explorer.exe", AppDomain.CurrentDomain.BaseDirectory); } catch { }
+                try { Process.Start(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"), AppDomain.CurrentDomain.BaseDirectory); } catch { }
             }));
 
             tSp.Children.Add(utilGrid);

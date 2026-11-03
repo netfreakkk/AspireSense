@@ -6,10 +6,10 @@
 .vs/
 bin/
 obj/
+Build/
 
-# Release binary archives (uploaded to GitHub Releases)
+# Release binary archives (distributed via GitHub Releases)
 *.zip
 *-Setup.exe
 *_old*.exe
 AspireSense_old*.exe
-

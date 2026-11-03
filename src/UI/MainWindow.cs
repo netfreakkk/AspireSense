@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -115,9 +115,11 @@ namespace AspireSense
         public const uint VK_O = 0x4F;
 
         [DllImport("user32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
         [DllImport("user32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         private TextBlock lblScenarioStatus;
@@ -575,7 +577,7 @@ namespace AspireSense
 
             Button btnMin = new Button
             {
-                Content = "—",
+                Content = "\u2014",
                 Width = 36,
                 Height = 30,
                 Foreground = DesignTokens.BrushTextSecondary,
@@ -591,7 +593,7 @@ namespace AspireSense
 
             Button btnClose = new Button
             {
-                Content = "✕",
+                Content = "\u2715",
                 Width = 36,
                 Height = 30,
                 Foreground = DesignTokens.BrushTextSecondary,
@@ -890,7 +892,24 @@ namespace AspireSense
                     }
                 }
 
-                // 2. Periodic Network Latency Ping (Every 5 Seconds)
+                // 2. EC Anti-Hallucination Arbiter Engine (Always evaluate safety logic in background)
+                if (currentFanMode != 1 && heatFlushRemaining == 0)
+                {
+                    bool isGaming = GameTelemetryEngine.IsGameActive || (d.GpuUsage >= 45.0f && d.GpuTemp >= 58);
+                    EcAntiHallucinationEngine.Update(d.CpuTemp, d.GpuTemp, d.CpuUsage, d.GpuUsage, d.CpuWatts, isGaming);
+                }
+
+                // 3. Active Thermal Watchdog (Always safeguard hardware in background)
+                EvaluateThermalWatchdog(d);
+
+                // 4. PERFORMANCE OPTIMIZATION (Action Plan 4.4):
+                // Skip all heavy WPF visual tree layout/rendering when window is minimized or hidden
+                if (this.WindowState == WindowState.Minimized || !this.IsVisible)
+                {
+                    return;
+                }
+
+                // 5. Periodic Network Latency Ping (Every 5 Seconds, only when UI visible)
                 pingTick++;
                 if (pingTick >= 5)
                 {
@@ -1061,6 +1080,14 @@ namespace AspireSense
                     catch { }
                 }
 
+            }
+            catch { }
+        }
+
+        private void EvaluateThermalWatchdog(HardwareBridge.SensorData d)
+        {
+            try
+            {
                 // ACTIVE THERMAL WATCHDOG: Safeguard hardware against sustained excessive temperatures with auto-recovery
                 bool isSustainedHighHeat = (d.CpuTemp >= 92 || d.GpuTemp >= 86);
                 if (isSustainedHighHeat && (currentFanMode == 3 || (currentFanMode == 6 && currentCustomDuty < 80)))

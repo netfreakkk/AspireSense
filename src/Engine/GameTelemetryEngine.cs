@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -20,7 +20,6 @@ using Path = System.Windows.Shapes.Path;
 
 namespace AspireSense
 {
-    // ==========================================
     // ==========================================
     // ZERO-HOOK DIRECTX / D3D REAL-TIME TELEMETRY ENGINE
     // ==========================================
@@ -205,12 +204,15 @@ namespace AspireSense
         public delegate void EventRecordCallback([In] ref EVENT_RECORD EventRecord);
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint StartTrace(out ulong TraceHandle, string InstanceName, IntPtr Properties);
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint ControlTrace(ulong TraceHandle, string InstanceName, IntPtr Properties, uint ControlCode);
 
         [DllImport("advapi32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint EnableTraceEx2(
             ulong TraceHandle,
             ref Guid ProviderId,
@@ -223,27 +225,35 @@ namespace AspireSense
         );
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern IntPtr OpenTraceW(IntPtr Logfile);
 
         [DllImport("advapi32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint ProcessTrace(IntPtr[] HandleArray, uint HandleCount, IntPtr StartTime, IntPtr EndTime);
 
         [DllImport("advapi32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint CloseTrace(IntPtr TraceHandle);
 
         [DllImport("user32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool CloseHandle(IntPtr hObject);
 
         private const uint EVENT_TRACE_REAL_TIME_MODE = 0x00000100;
@@ -284,13 +294,19 @@ namespace AspireSense
         private static bool isRunning = false;
 
         private static readonly object frameLock = new object();
-        private static readonly Queue<long> frameTimestamps = new Queue<long>();
-        private static readonly List<double> recentFrameTimes = new List<double>();
+
+        // High-performance circular ring buffer for zero-allocation frame metrics
+        private const int RING_BUFFER_SIZE = 512;
+        private static readonly double[] frameTimeRing = new double[RING_BUFFER_SIZE];
+        private static int ringHead = 0;
+        private static int ringCount = 0;
+
         private static readonly Queue<double> rollingFpsHistory = new Queue<double>();
         private static long lastFrameTimestamp = 0;
         private static long lastFrameWallClock = 0;
         private static bool wasInLoadingScreen = false;
         private static int selfPid = 0;
+        private static bool exitHooked = false;
 
         public static void Start()
         {
@@ -301,6 +317,12 @@ namespace AspireSense
                 selfPid = Process.GetCurrentProcess().Id;
             }
             catch { }
+
+            if (!exitHooked)
+            {
+                exitHooked = true;
+                AppDomain.CurrentDomain.ProcessExit += (s, e) => Stop();
+            }
 
             traceThread = new Thread(RunEtwTrace);
             traceThread.IsBackground = true;
@@ -334,8 +356,9 @@ namespace AspireSense
                 pLoggerName = Marshal.StringToHGlobalUni(SessionName);
                 Marshal.Copy(SessionName.ToCharArray(), 0, IntPtr.Add(pProperties, propSize), SessionName.Length);
 
-                // Stop any leftover session first
+                // Stop any leftover kernel session from previous instance or crash
                 ControlTrace(0, SessionName, pProperties, EVENT_CONTROL_CODE_STOP_TRACE);
+                Thread.Sleep(20);
 
                 uint status = StartTrace(out sessionHandle, SessionName, pProperties);
                 if (status != 0)
@@ -396,6 +419,10 @@ namespace AspireSense
                 uint pid = record.EventHeader.ProcessId;
                 if (pid == 0 || pid == (uint)selfPid) return;
 
+                // Ultra fast-path filter: immediately drop events from non-target processes before doing any work
+                uint currentTarget = targetGamePid;
+                if (currentTarget != 0 && pid != currentTarget) return;
+
                 ushort evId = record.EventHeader.EventId;
                 Guid prov = record.EventHeader.ProviderId;
 
@@ -422,8 +449,7 @@ namespace AspireSense
 
                 if (isPresent)
                 {
-                    uint targetPid = targetGamePid;
-                    if (targetPid == 0)
+                    if (currentTarget == 0)
                     {
                         string autoName = GetProcessNameSafe((int)pid);
                         if (!IsSystemProcess(autoName))
@@ -431,11 +457,11 @@ namespace AspireSense
                             targetGamePid = pid;
                             ActiveProcessId = pid;
                             ActiveProcessName = autoName;
-                            targetPid = pid;
+                            currentTarget = pid;
                         }
                     }
 
-                    if (targetPid != 0 && pid == targetPid)
+                    if (currentTarget != 0 && pid == currentTarget)
                     {
                         long qpcTime = record.EventHeader.TimeStamp;
                         if (qpcTime <= 0)
@@ -451,28 +477,22 @@ namespace AspireSense
                                 double deltaMs = deltaTicks * 1000.0 / Stopwatch.Frequency;
 
                                 // Deduplicate duplicate events for same frame within 0.5ms (e.g. swapchain + MPO overlay)
-                                if (deltaMs >= 0.0 && deltaMs < 0.5)
-                                {
-                                    return;
-                                }
-                                if (deltaMs < 0.0 && deltaMs > -0.5)
+                                if (deltaMs >= -0.5 && deltaMs < 0.5)
                                 {
                                     return;
                                 }
 
                                 if (deltaMs >= 0.5 && deltaMs <= 200.0)
                                 {
-                                    recentFrameTimes.Add(deltaMs);
-                                    if (recentFrameTimes.Count > 500)
-                                    {
-                                        recentFrameTimes.RemoveAt(0);
-                                    }
+                                    // Insert into circular ring buffer: O(1) time, 0 heap allocations
+                                    frameTimeRing[ringHead] = deltaMs;
+                                    ringHead = (ringHead + 1) % RING_BUFFER_SIZE;
+                                    if (ringCount < RING_BUFFER_SIZE) ringCount++;
                                 }
                             }
 
                             lastFrameTimestamp = qpcTime;
                             lastFrameWallClock = Stopwatch.GetTimestamp();
-                            frameTimestamps.Enqueue(qpcTime);
                         }
                     }
                 }
@@ -539,6 +559,11 @@ namespace AspireSense
                    low.Contains("shellexperiencehost") ||
                    low.Contains("startmenuexperiencehost") ||
                    low.Contains("applicationframehost") ||
+                   low.Contains("gamebar") ||
+                   low.Contains("gamebarftserver") ||
+                   low.Contains("xbox") ||
+                   low.Contains("notification") ||
+                   low.Contains("actioncenter") ||
                    low.Contains("lockapp") ||
                    low.Contains("dwm");
         }
@@ -555,14 +580,16 @@ namespace AspireSense
                     if (pid != 0 && pid != (uint)selfPid)
                     {
                         string pName = GetProcessNameSafe((int)pid);
+                        // Only switch active game target if foreground is an actual application/game,
+                        // NOT a system process, game bar, or AspireSense window
                         if (!IsSystemProcess(pName))
                         {
                             if (targetGamePid != pid)
                             {
                                 lock (frameLock)
                                 {
-                                    frameTimestamps.Clear();
-                                    recentFrameTimes.Clear();
+                                    ringHead = 0;
+                                    ringCount = 0;
                                     rollingFpsHistory.Clear();
                                     lastFrameTimestamp = 0;
                                     lastFrameWallClock = 0;
@@ -591,19 +618,20 @@ namespace AspireSense
                     OnePercentLowFps = 0.0;
                     CurrentFrameTimeMs = 0.0;
                     rollingFpsHistory.Clear();
-                    recentFrameTimes.Clear();
                     wasInLoadingScreen = true;
                 }
                 else
                 {
-                    // 1. Current FPS: 1.0-second rolling window across recent frames (rock-solid, zero micro-hiccups)
-                    if (recentFrameTimes.Count >= 4)
+                    // 1. Current FPS: 1.0-second rolling window across recent frames in ring buffer
+                    if (ringCount >= 4)
                     {
                         double sumMs = 0;
                         int sampleCount = 0;
-                        for (int i = recentFrameTimes.Count - 1; i >= 0; i--)
+                        for (int i = 0; i < ringCount; i++)
                         {
-                            sumMs += recentFrameTimes[i];
+                            int idx = (ringHead - 1 - i + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+                            double frameMs = frameTimeRing[idx];
+                            sumMs += frameMs;
                             sampleCount++;
                             if (sumMs >= 1000.0) // 1.0 second window of rendered frames
                             {
@@ -616,11 +644,12 @@ namespace AspireSense
                         CurrentFrameTimeMs = (sampleCount > 0) ? Math.Round(sumMs / sampleCount, 1) : 0.0;
 
                         // 2. 1% Low FPS: Lowest 1% of FPS in a 4.0-second time window
-                        List<double> windowFpsList = new List<double>();
+                        List<double> windowFpsList = new List<double>(128);
                         double windowSumMs = 0;
-                        for (int i = recentFrameTimes.Count - 1; i >= 0; i--)
+                        for (int i = 0; i < ringCount; i++)
                         {
-                            double frameMs = recentFrameTimes[i];
+                            int idx = (ringHead - 1 - i + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+                            double frameMs = frameTimeRing[idx];
                             windowSumMs += frameMs;
                             if (frameMs >= 2.5 && frameMs <= 150.0) // legitimate gameplay frame times
                             {
@@ -674,7 +703,6 @@ namespace AspireSense
                             {
                                 // Clean transition from loading screen into gameplay!
                                 rollingFpsHistory.Clear();
-                                recentFrameTimes.Clear();
                                 wasInLoadingScreen = false;
                             }
 
@@ -691,9 +719,10 @@ namespace AspireSense
                             }
                         }
                     }
-                    else if (recentFrameTimes.Count > 0)
+                    else if (ringCount > 0)
                     {
-                        double lastMs = recentFrameTimes[recentFrameTimes.Count - 1];
+                        int lastIdx = (ringHead - 1 + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+                        double lastMs = frameTimeRing[lastIdx];
                         CurrentFps = (lastMs > 0) ? Math.Round(1000.0 / lastMs, 0) : 0.0;
                         CurrentFrameTimeMs = Math.Round(lastMs, 1);
                         OnePercentLowFps = Math.Round(CurrentFps * 0.9, 0);

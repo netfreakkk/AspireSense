@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -25,18 +25,21 @@ namespace AspireSense
     // ==========================================
     public static class HardwareBridge
     {
-
         // NVIDIA NVML API for exact GPU utilization matching Task Manager
         [DllImport("nvml.dll", EntryPoint = "nvmlInit_v2")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlInit();
 
         [DllImport("nvml.dll", EntryPoint = "nvmlShutdown")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlShutdown();
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetHandleByIndex_v2")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetHandleByIndex(uint index, out IntPtr device);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetName")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetName(IntPtr device, StringBuilder name, uint length);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -47,15 +50,19 @@ namespace AspireSense
         }
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetUtilizationRates")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetUtilizationRates(IntPtr device, out nvmlUtilization_t utilization);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetTemperature")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetTemperature(IntPtr device, int sensorType, out uint temp);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetPowerUsage")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetPowerUsage(IntPtr device, out uint powerMw);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetEnforcedPowerLimit")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetEnforcedPowerLimit(IntPtr device, out uint limitMw);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -67,18 +74,23 @@ namespace AspireSense
         }
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetMemoryInfo")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetMemoryInfo(IntPtr device, out nvmlMemory_t memory);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetClockInfo")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetClockInfo(IntPtr device, int type, out uint clockMHz);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrentClocksThrottleReasons")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetCurrentClocksThrottleReasons(IntPtr device, out ulong reasons);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrPcieLinkGeneration")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetCurrPcieLinkGeneration(IntPtr device, out uint currLinkGen);
 
         [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetCurrPcieLinkWidth")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int nvmlDeviceGetCurrPcieLinkWidth(IntPtr device, out uint currLinkWidth);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -96,6 +108,7 @@ namespace AspireSense
         }
 
         [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -110,12 +123,15 @@ namespace AspireSense
         }
 
         [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lp);
 
         [DllImport("kernel32.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern ulong GetTickCount64();
 
         [DllImport("psapi.dll")]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         public static extern int EmptyWorkingSet(IntPtr hwProc);
 
         private static readonly object ecLock = new object();
@@ -141,6 +157,19 @@ namespace AspireSense
         public static double ChassisTotalRamGb = 16.0;
         public static int CachedBatteryDesignMwh = 54000;
         public static int CachedBatteryFullMwh = 54000;
+
+        public static bool IsHardwareControlAvailable
+        {
+            get
+            {
+                if (DetectedVendor == HardwareVendor.Acer) return AcerInsydeBridge.IsAvailable;
+                if (DetectedVendor == HardwareVendor.Asus) return AsusAcpiBridge.IsAvailable;
+                if (DetectedVendor == HardwareVendor.Lenovo) return LenovoWmiBridge.IsAvailable;
+                if (DetectedVendor == HardwareVendor.Hp) return HpWmiBridge.IsAvailable;
+                if (DetectedVendor == HardwareVendor.Dell) return DellWmiBridge.IsAvailable;
+                return false;
+            }
+        }
 
         public static void InitializeHardware()
         {
@@ -189,7 +218,8 @@ namespace AspireSense
                                     if (vName != null)
                                     {
                                         string sName = vName.ToString().Trim();
-                                        if (sName.Contains("NVIDIA") || sName.Contains("GeForce") || sName.Contains("RTX") || sName.Contains("GTX") || sName.Contains("Radeon") || sName.Contains("Arc"))
+                                        if (sName.Contains("NVIDIA") || sName.Contains("GeForce") || sName.Contains("RTX") || sName.Contains("GTX") || sName.Contains("Radeon") ||
+                                            sName.Contains("Intel(R) Arc") || sName.Contains("Arc(TM)") || sName.Contains("Arc A"))
                                         {
                                             ChassisGpuName = sName;
                                             break;
@@ -254,7 +284,13 @@ namespace AspireSense
 
                         string combined = (sysMfg + " " + boardMfg + " " + prodName).ToLowerInvariant();
 
-                        if (combined.Contains("asus") || combined.Contains("tuf") || combined.Contains("rog"))
+                        // Priority 1: Check Acer hardware first (prevents false matches on multi-word BIOS strings)
+                        if (combined.Contains("acer") || combined.Contains("aspire") || combined.Contains("nitro") || combined.Contains("predator"))
+                        {
+                            DetectedVendor = HardwareVendor.Acer;
+                            ChassisModel = prodName.StartsWith("Acer", StringComparison.OrdinalIgnoreCase) ? prodName : "Acer " + prodName;
+                        }
+                        else if (combined.Contains("asus") || combined.Contains("tuf") || combined.Contains("rog"))
                         {
                             DetectedVendor = HardwareVendor.Asus;
                             ChassisModel = prodName.StartsWith("ASUS", StringComparison.OrdinalIgnoreCase) ? prodName : "ASUS " + prodName;
@@ -264,7 +300,8 @@ namespace AspireSense
                             DetectedVendor = HardwareVendor.Lenovo;
                             ChassisModel = prodName.StartsWith("Lenovo", StringComparison.OrdinalIgnoreCase) ? prodName : "Lenovo " + prodName;
                         }
-                        else if (combined.Contains("hp") || combined.Contains("hewlett") || combined.Contains("omen") || combined.Contains("victus"))
+                        else if (sysMfg.StartsWith("hp", StringComparison.OrdinalIgnoreCase) || sysMfg.StartsWith("hewlett", StringComparison.OrdinalIgnoreCase) ||
+                                 combined.Contains("omen") || combined.Contains("victus") || combined.Contains("pavilion"))
                         {
                             DetectedVendor = HardwareVendor.Hp;
                             ChassisModel = prodName.StartsWith("HP", StringComparison.OrdinalIgnoreCase) ? prodName : "HP " + prodName;
@@ -273,11 +310,6 @@ namespace AspireSense
                         {
                             DetectedVendor = HardwareVendor.Dell;
                             ChassisModel = (prodName.StartsWith("Dell", StringComparison.OrdinalIgnoreCase) || prodName.StartsWith("Alienware", StringComparison.OrdinalIgnoreCase)) ? prodName : "Dell " + prodName;
-                        }
-                        else if (combined.Contains("acer") || combined.Contains("aspire") || combined.Contains("nitro") || combined.Contains("predator"))
-                        {
-                            DetectedVendor = HardwareVendor.Acer;
-                            ChassisModel = prodName.StartsWith("Acer", StringComparison.OrdinalIgnoreCase) ? prodName : "Acer " + prodName;
                         }
                         else
                         {
@@ -532,28 +564,30 @@ namespace AspireSense
                 }
                 catch { }
 
-                // 3. Trim non-critical user-session processes without touching system drivers or anti-cheat protected processes
+                // 3. Trim non-critical user-session processes without touching system drivers, active game, or audio stack
                 int currentSession = Process.GetCurrentProcess().SessionId;
+                uint activeGamePid = GameTelemetryEngine.ActiveProcessId;
                 Process[] procs = Process.GetProcesses();
                 foreach (Process p in procs)
                 {
-                    try
+                    using (p)
                     {
-                        if (p.SessionId == currentSession && p.Id != Process.GetCurrentProcess().Id)
+                        try
                         {
-                            string name = p.ProcessName.ToLowerInvariant();
-                            if (!name.Contains("csrss") && !name.Contains("lsass") && !name.Contains("services") &&
-                                !name.Contains("dwm") && !name.Contains("explorer") && !name.Contains("system") &&
-                                !name.Contains("audiodg") && !name.Contains("nvvsvc") && !name.Contains("nvdisplay"))
+                            if (p.SessionId == currentSession && p.Id != Process.GetCurrentProcess().Id && p.Id != (int)activeGamePid)
                             {
-                                EmptyWorkingSet(p.Handle);
+                                string name = p.ProcessName.ToLowerInvariant();
+                                if (!name.Contains("csrss") && !name.Contains("lsass") && !name.Contains("services") &&
+                                    !name.Contains("dwm") && !name.Contains("explorer") && !name.Contains("system") &&
+                                    !name.Contains("audiodg") && !name.Contains("nvvsvc") && !name.Contains("nvdisplay") &&
+                                    !name.Contains("nvcontainer") && !name.Contains("amdrsserv") && !name.Contains("steam") &&
+                                    !name.Contains("discord") && !name.Contains("epicgames") && !name.Contains("aspiresense"))
+                                {
+                                    EmptyWorkingSet(p.Handle);
+                                }
                             }
                         }
-                    }
-                    catch { }
-                    finally
-                    {
-                        try { p.Dispose(); } catch { }
+                        catch { }
                     }
                 }
             }
@@ -617,20 +651,19 @@ namespace AspireSense
                 Process[] procs = Process.GetProcesses();
                 for (int i = 0; i < procs.Length; i++)
                 {
-                    try
+                    using (procs[i])
                     {
-                        string name = procs[i].ProcessName;
-                        if (name.Equals("Idle", StringComparison.OrdinalIgnoreCase) || name.Equals("System", StringComparison.OrdinalIgnoreCase)) continue;
-                        double mb = procs[i].WorkingSet64 / (1024.0 * 1024.0);
-                        if (dict.ContainsKey(name))
-                            dict[name] += mb;
-                        else
-                            dict[name] = mb;
-                    }
-                    catch { }
-                    finally
-                    {
-                        try { procs[i].Dispose(); } catch { }
+                        try
+                        {
+                            string name = procs[i].ProcessName;
+                            if (name.Equals("Idle", StringComparison.OrdinalIgnoreCase) || name.Equals("System", StringComparison.OrdinalIgnoreCase)) continue;
+                            double mb = procs[i].WorkingSet64 / (1024.0 * 1024.0);
+                            if (dict.ContainsKey(name))
+                                dict[name] += mb;
+                            else
+                                dict[name] = mb;
+                        }
+                        catch { }
                     }
                 }
 
@@ -692,6 +725,8 @@ namespace AspireSense
             data.GpuThrottleStatus = "OPTIMAL";
             data.VramTotalGb = 6.0;
 
+            bool isSensorEstimated = false;
+
             if (DetectedVendor == HardwareVendor.Asus)
             {
                 int asusCpuRpm = AsusAcpiBridge.GetCpuFanRpm();
@@ -711,8 +746,9 @@ namespace AspireSense
                 {
                     int tzTemp = GetThermalZoneTemperature();
                     data.CpuTemp = (tzTemp >= 20 && tzTemp <= 115) ? tzTemp : 45;
+                    isSensorEstimated = true;
                 }
-                data.GpuTemp = 35; // Default before NVML reads it
+                data.GpuTemp = 35; // Initial baseline before NVML reads it
             }
             else if (DetectedVendor == HardwareVendor.Acer && AcerInsydeBridge.IsAvailable)
             {
@@ -735,6 +771,7 @@ namespace AspireSense
                         data.GpuTemp = 35;
                         data.CpuRpm = 1000;
                         data.GpuRpm = 0;
+                        isSensorEstimated = true;
                     }
                 }
             }
@@ -744,6 +781,7 @@ namespace AspireSense
                 int tzTemp = GetThermalZoneTemperature();
                 data.CpuTemp = (tzTemp >= 20 && tzTemp <= 115) ? tzTemp : 48;
                 data.GpuTemp = 38;
+                isSensorEstimated = true;
 
                 // Calibrated fan telemetry estimation based on active mode & thermal demand
                 if (CurrentFanMode == 1) // MAX / Turbo
@@ -839,9 +877,6 @@ namespace AspireSense
                     uint pMw;
                     if (nvmlDeviceGetPowerUsage(nvmlDevice, out pMw) == 0 && pMw > 0)
                     {
-                        // Sanity check: On mobile GPUs with Optimus/D3Cold sleep states,
-                        // nvmlDeviceGetPowerUsage returns ~590006 mW (0x900B6) as an ACPI/EC dummy register value when idling or sleeping.
-                        // Maximum possible mobile laptop GPU TGP is ~175W (and on RTX 4050 it is 60W-75W).
                         uint maxLimit = (nvmlPowerLimitMw > 0) ? (uint)(nvmlPowerLimitMw * 1.35) : 180000;
                         if (pMw <= maxLimit && pMw < 250000)
                         {
@@ -849,7 +884,6 @@ namespace AspireSense
                         }
                         else
                         {
-                            // 590,000+ mW indicates GPU is in deep idle/sleep (Optimus D3Cold)
                             if (data.GpuUsage <= 1)
                             {
                                 data.GpuWatts = 0f;
@@ -874,6 +908,9 @@ namespace AspireSense
             {
                 data.GpuUsage = 0;
             }
+
+            // Update estimated sensor flag for UI transparency
+            EcAntiHallucinationEngine.IsEstimatedSensor = isSensorEstimated;
 
             try
             {

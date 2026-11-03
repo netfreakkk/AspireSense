@@ -12,9 +12,11 @@ namespace AspireSense
     public static class AcerInsydeBridge
     {
         [DllImport("InsydeDCHU.dll", CallingConvention = CallingConvention.StdCall)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory)]
         public static extern int SetDCHU_Data(int command, byte[] buffer, int length);
 
         [DllImport("InsydeDCHU.dll", CallingConvention = CallingConvention.StdCall)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.AssemblyDirectory)]
         public static extern int GetDCHU_Data_Buffer(int command, [In, Out] byte[] buffer);
 
         private static bool? isDllPresent = null;
@@ -28,8 +30,7 @@ namespace AspireSense
                     string dir2 = "";
                     try { dir2 = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location); } catch { }
                     isDllPresent = (File.Exists(Path.Combine(dir1, "InsydeDCHU.dll")) ||
-                                    (!string.IsNullOrEmpty(dir2) && File.Exists(Path.Combine(dir2, "InsydeDCHU.dll"))) ||
-                                    File.Exists("InsydeDCHU.dll"));
+                                    (!string.IsNullOrEmpty(dir2) && File.Exists(Path.Combine(dir2, "InsydeDCHU.dll"))));
                 }
                 return isDllPresent.Value;
             }

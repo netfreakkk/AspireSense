@@ -558,13 +558,13 @@ namespace AspireSense
 
             Border btnTaskMgr = CreateToolButton("📊 Task Manager", () =>
             {
-                try { Process.Start("taskmgr.exe"); } catch { }
+                try { Process.Start(System.IO.Path.Combine(Environment.SystemDirectory, "taskmgr.exe")); } catch { }
             });
             btnSp.Children.Add(btnTaskMgr);
 
             Border btnNvidia = CreateToolButton("🎮 NVIDIA Panel", () =>
             {
-                try { Process.Start("control.exe", "/name Microsoft.NvidiaControlPanel"); }
+                try { Process.Start(System.IO.Path.Combine(Environment.SystemDirectory, "control.exe"), "/name Microsoft.NvidiaControlPanel"); }
                 catch
                 {
                     try { Process.Start("C:\\Program Files\\NVIDIA Corporation\\Control Panel Client\\nvcplui.exe"); } catch { }

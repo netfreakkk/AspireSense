@@ -54,7 +54,7 @@ namespace AspireSenseInstaller
             this.BorderBrush = new SolidColorBrush(Color.FromRgb(0, 160, 255));
             this.BorderThickness = new Thickness(1);
 
-            defaultInstallDir = IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "AspireSense");
+            defaultInstallDir = IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AspireSense");
 
             LoadEmbeddedIcon();
             BuildLayout();
@@ -175,7 +175,7 @@ namespace AspireSenseInstaller
 
             Button btnMin = new Button
             {
-                Content = "—",
+                Content = "\u2014",
                 Width = 30,
                 Height = 28,
                 Foreground = Brushes.White,
@@ -189,7 +189,7 @@ namespace AspireSenseInstaller
 
             Button btnClose = new Button
             {
-                Content = "✕",
+                Content = "\u2715",
                 Width = 30,
                 Height = 28,
                 Foreground = Brushes.White,
@@ -673,16 +673,30 @@ namespace AspireSenseInstaller
                 {
                     if (key != null)
                     {
-                        string mfg = (key.GetValue("SystemManufacturer") ?? "").ToString();
-                        string board = (key.GetValue("BaseBoardManufacturer") ?? "").ToString();
-                        string prod = (key.GetValue("SystemProductName") ?? "").ToString();
+                        string mfg = (key.GetValue("SystemManufacturer") ?? "").ToString().Trim().ToLowerInvariant();
+                        string board = (key.GetValue("BaseBoardManufacturer") ?? "").ToString().Trim().ToLowerInvariant();
+                        string prod = (key.GetValue("SystemProductName") ?? "").ToString().Trim().ToLowerInvariant();
                         string combined = (mfg + " " + board + " " + prod).ToLowerInvariant();
 
-                        if (combined.Contains("asus") || combined.Contains("tuf") || combined.Contains("rog")) return "ASUS";
-                        if (combined.Contains("lenovo") || combined.Contains("legion") || combined.Contains("ideapad") || combined.Contains("loq")) return "Lenovo";
-                        if (combined.Contains("hp") || combined.Contains("hewlett") || combined.Contains("omen") || combined.Contains("victus")) return "HP";
-                        if (combined.Contains("dell") || combined.Contains("alienware")) return "Dell";
-                        if (combined.Contains("acer") || combined.Contains("aspire") || combined.Contains("nitro") || combined.Contains("predator")) return "Acer";
+                        // 1. Prioritize Acer hardware
+                        if (combined.Contains("acer") || combined.Contains("aspire") || combined.Contains("nitro") || combined.Contains("predator"))
+                            return "Acer";
+
+                        // 2. ASUS Gaming
+                        if (combined.Contains("asus") || combined.Contains("tuf") || combined.Contains("rog") || combined.Contains("zenbook") || combined.Contains("vivobook"))
+                            return "ASUS";
+
+                        // 3. Lenovo
+                        if (combined.Contains("lenovo") || combined.Contains("legion") || combined.Contains("ideapad") || combined.Contains("thinkpad") || combined.Contains("loq"))
+                            return "Lenovo";
+
+                        // 4. Dell
+                        if (combined.Contains("dell") || combined.Contains("alienware"))
+                            return "Dell";
+
+                        // 5. HP: Explicit prefix/substring check (prevents false matches on words containing 'hp')
+                        if (mfg.StartsWith("hp") || mfg.Contains("hewlett") || combined.Contains("omen") || combined.Contains("victus") || combined.Contains("pavilion"))
+                            return "HP";
                     }
                 }
             }
@@ -785,9 +799,18 @@ namespace AspireSenseInstaller
                 {
                     try
                     {
-                        using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                        // Register elevated scheduled task so AspireSense can start with highest privileges at logon
+                        ProcessStartInfo psi = new ProcessStartInfo
                         {
-                            if (key != null) key.SetValue("AspireSense", "\"" + appExe + "\"");
+                            FileName = IOPath.Combine(Environment.SystemDirectory, "schtasks.exe"),
+                            Arguments = string.Format("/create /tn \"AspireSense\" /tr \"\\\"{0}\\\" --minimized\" /sc onlogon /rl highest /f", appExe),
+                            WindowStyle = ProcessWindowStyle.Hidden,
+                            CreateNoWindow = true,
+                            UseShellExecute = false
+                        };
+                        using (Process pTask = Process.Start(psi))
+                        {
+                            if (pTask != null) pTask.WaitForExit(3000);
                         }
                     }
                     catch { }
@@ -854,51 +877,116 @@ namespace AspireSenseInstaller
 
         private static void RegisterWindowsUninstall(string installDir, string uninstallPath, string iconPath)
         {
-            try
+            RegistryKey[] targets = new RegistryKey[] { Registry.LocalMachine, Registry.CurrentUser };
+            foreach (RegistryKey root in targets)
             {
-                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AspireSense"))
+                try
                 {
-                    if (key != null)
+                    using (RegistryKey key = root.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AspireSense"))
                     {
-                        key.SetValue("DisplayName", "AspireSense");
-                        key.SetValue("DisplayVersion", "1.1.0");
-                        key.SetValue("Publisher", "netfreakkk");
-                        key.SetValue("DisplayIcon", iconPath);
-                        key.SetValue("InstallLocation", installDir);
-                        key.SetValue("UninstallString", "\"" + uninstallPath + "\" /uninstall");
-                        key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
-                        key.SetValue("EstimatedSize", 4800, RegistryValueKind.DWord);
-                        key.SetValue("HelpLink", "https://github.com/netfreakkk/AspireSense");
-                        key.SetValue("URLInfoAbout", "https://github.com/netfreakkk/AspireSense");
-                        key.SetValue("NoModify", 1, RegistryValueKind.DWord);
-                        key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+                        if (key != null)
+                        {
+                            key.SetValue("DisplayName", "AspireSense");
+                            key.SetValue("DisplayVersion", "1.1.0");
+                            key.SetValue("Publisher", "netfreakkk");
+                            key.SetValue("DisplayIcon", iconPath);
+                            key.SetValue("InstallLocation", installDir);
+                            key.SetValue("UninstallString", "\"" + uninstallPath + "\" /uninstall");
+                            key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
+                            key.SetValue("EstimatedSize", 4800, RegistryValueKind.DWord);
+                            key.SetValue("HelpLink", "https://github.com/netfreakkk/AspireSense");
+                            key.SetValue("URLInfoAbout", "https://github.com/netfreakkk/AspireSense");
+                            key.SetValue("NoModify", 1, RegistryValueKind.DWord);
+                            key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+                        }
                     }
                 }
+                catch { }
             }
-            catch { }
         }
 
         private void ExecuteUninstall()
         {
             try
             {
+                string installDir = IOPath.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                string markerExe = IOPath.Combine(installDir, "AspireSense.exe");
+
+                // Critical Safety Check: Prevent wiping non-installation directories (e.g. Downloads or Desktop)
+                if (string.IsNullOrEmpty(installDir) || !File.Exists(markerExe))
+                {
+                    MessageBox.Show(
+                        "Uninstaller must be run from an active AspireSense installation directory containing AspireSense.exe.\n\nOperation aborted for system safety.",
+                        "Safety Abort",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    this.Close();
+                    return;
+                }
+
+                // Block protected system & user roots
+                string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                string progFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string downloads = IOPath.Combine(userProfile, "Downloads");
+
+                string normInstall = installDir.TrimEnd('\\', '/');
+                if (string.Equals(normInstall, progFiles.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normInstall, userProfile.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normInstall, desktop.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normInstall, downloads.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normInstall, winDir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
+                    normInstall.Length <= 3)
+                {
+                    MessageBox.Show(
+                        "Cannot uninstall from a protected Windows or user profile root path: " + installDir,
+                        "Safety Abort",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
+                    this.Close();
+                    return;
+                }
+
                 // Kill running AspireSense processes
                 Process[] procs = Process.GetProcessesByName("AspireSense");
                 foreach (Process p in procs)
                 {
-                    try { p.CloseMainWindow(); } catch { }
-                    try { p.Kill(); } catch { }
+                    using (p)
+                    {
+                        try { p.CloseMainWindow(); } catch { }
+                        try { p.Kill(); } catch { }
+                        try { p.WaitForExit(1000); } catch { }
+                    }
                 }
 
                 // Remove Desktop shortcut
-                string desktopPath = IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "AspireSense.lnk");
+                string desktopPath = IOPath.Combine(desktop, "AspireSense.lnk");
                 if (File.Exists(desktopPath)) { try { File.Delete(desktopPath); } catch { } }
 
                 // Remove Start Menu shortcut
                 string startMenuShortcut = IOPath.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs", "AspireSense.lnk");
                 if (File.Exists(startMenuShortcut)) { try { File.Delete(startMenuShortcut); } catch { } }
 
-                // Remove Run on Startup registry
+                // Remove elevated scheduled startup task
+                try
+                {
+                    ProcessStartInfo psiTask = new ProcessStartInfo
+                    {
+                        FileName = IOPath.Combine(Environment.SystemDirectory, "schtasks.exe"),
+                        Arguments = "/delete /tn \"AspireSense\" /f",
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    using (Process pTask = Process.Start(psiTask))
+                    {
+                        if (pTask != null) pTask.WaitForExit(2000);
+                    }
+                }
+                catch { }
+
+                // Remove legacy Run on Startup registry key if present
                 try
                 {
                     using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
@@ -908,35 +996,40 @@ namespace AspireSenseInstaller
                 }
                 catch { }
 
-                // Remove Add/Remove Programs entry
-                try
-                {
-                    Registry.CurrentUser.DeleteSubKeyTree(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AspireSense", false);
-                }
-                catch { }
+                // Remove Add/Remove Programs registry entries
+                try { Registry.LocalMachine.DeleteSubKeyTree(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AspireSense", false); } catch { }
+                try { Registry.CurrentUser.DeleteSubKeyTree(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\AspireSense", false); } catch { }
 
-                // Remove application files
-                string installDir = IOPath.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-                string[] filesToDelete = new string[] { "AspireSense.exe", "InsydeDCHU.dll", "logo.png", "app.ico", "README.md", "LICENSE" };
-                foreach (string f in filesToDelete)
+                // Remove known application files explicitly in C#
+                string[] knownFiles = new string[] {
+                    "AspireSense.exe",
+                    "InsydeDCHU.dll",
+                    "logo.png",
+                    "app.ico",
+                    "README.md",
+                    "RELEASE_NOTES.md",
+                    "LICENSE",
+                    "config.json",
+                    "AspireSense.exe.config"
+                };
+                foreach (string f in knownFiles)
                 {
                     string p = IOPath.Combine(installDir, f);
                     if (File.Exists(p)) { try { File.Delete(p); } catch { } }
                 }
 
-                // Self delete script
-                if (!string.IsNullOrEmpty(installDir) && installDir.Length >= 6 && Directory.Exists(installDir))
+                // Safe self-delete of Uninstall.exe and removal of folder WITHOUT /s
+                // rmdir without /s guarantees it will ONLY remove the directory if it is now completely empty!
+                string selfExe = Assembly.GetExecutingAssembly().Location;
+                string cmdExe = IOPath.Combine(Environment.SystemDirectory, "cmd.exe");
+                Process.Start(new ProcessStartInfo
                 {
-                    string batchScript = IOPath.Combine(IOPath.GetTempPath(), "remove_aspiresense.bat");
-                    string batchContent = string.Format("@echo off\r\ntimeout /t 1 /nobreak >nul\r\nrmdir /s /q \"{0}\"\r\ndel \"%~f0\"\r\n", installDir);
-                    File.WriteAllText(batchScript, batchContent);
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = batchScript,
-                        WindowStyle = ProcessWindowStyle.Hidden,
-                        CreateNoWindow = true
-                    });
-                }
+                    FileName = cmdExe,
+                    Arguments = string.Format("/c timeout /t 2 /nobreak >nul & del /f /q \"{0}\" & rmdir \"{1}\"", selfExe, installDir),
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
 
                 MessageBox.Show("AspireSense has been successfully uninstalled from your PC.", "Uninstallation Complete", MessageBoxButton.OK, MessageBoxImage.Information);
                 this.Close();
@@ -963,9 +1056,9 @@ namespace AspireSenseInstaller
                 }
             }
 
-            // Also check if running as Uninstall.exe
+            // Only enter uninstall mode if explicitly named Uninstall.exe
             string currentExeName = IOPath.GetFileName(Assembly.GetExecutingAssembly().Location);
-            if (currentExeName.IndexOf("uninstall", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (string.Equals(currentExeName, "Uninstall.exe", StringComparison.OrdinalIgnoreCase))
             {
                 isUninstall = true;
             }

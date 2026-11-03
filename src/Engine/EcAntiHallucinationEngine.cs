@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -41,6 +41,7 @@ namespace AspireSense
         public static string CurrentClassifierState = "Awaiting Sensor Data...";
         public static bool IsCurrentlyClamped = false;
         public static int CurrentAppliedMode = -1;
+        public static bool IsEstimatedSensor = false;
 
         private static List<string> decisionLogs = new List<string>();
         private static readonly object logLock = new object();
@@ -112,22 +113,29 @@ namespace AspireSense
         {
             try
             {
+                string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
                 PowerBoostTamed = !PowerBoostTamed;
                 int targetState = PowerBoostTamed ? 99 : 100;
                 string argsAc = string.Format("/setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX {0}", targetState);
                 string argsDc = string.Format("/setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX {0}", targetState);
 
-                ProcessStartInfo psi1 = new ProcessStartInfo("powercfg.exe", argsAc) { CreateNoWindow = true, UseShellExecute = false };
-                Process p1 = Process.Start(psi1);
-                if (p1 != null) p1.WaitForExit(1000);
+                ProcessStartInfo psi1 = new ProcessStartInfo(powercfg, argsAc) { CreateNoWindow = true, UseShellExecute = false };
+                using (Process p1 = Process.Start(psi1))
+                {
+                    if (p1 != null) p1.WaitForExit(1000);
+                }
 
-                ProcessStartInfo psi2 = new ProcessStartInfo("powercfg.exe", argsDc) { CreateNoWindow = true, UseShellExecute = false };
-                Process p2 = Process.Start(psi2);
-                if (p2 != null) p2.WaitForExit(1000);
+                ProcessStartInfo psi2 = new ProcessStartInfo(powercfg, argsDc) { CreateNoWindow = true, UseShellExecute = false };
+                using (Process p2 = Process.Start(psi2))
+                {
+                    if (p2 != null) p2.WaitForExit(1000);
+                }
 
-                ProcessStartInfo psiAct = new ProcessStartInfo("powercfg.exe", "/setactive SCHEME_CURRENT") { CreateNoWindow = true, UseShellExecute = false };
-                Process pAct = Process.Start(psiAct);
-                if (pAct != null) pAct.WaitForExit(1000);
+                ProcessStartInfo psiAct = new ProcessStartInfo(powercfg, "/setactive SCHEME_CURRENT") { CreateNoWindow = true, UseShellExecute = false };
+                using (Process pAct = Process.Start(psiAct))
+                {
+                    if (pAct != null) pAct.WaitForExit(1000);
+                }
 
                 if (PowerBoostTamed)
                 {
@@ -148,7 +156,8 @@ namespace AspireSense
         {
             try
             {
-                ProcessStartInfo psi = new ProcessStartInfo("powercfg.exe", "/query SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX")
+                string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
+                ProcessStartInfo psi = new ProcessStartInfo(powercfg, "/query SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX")
                 {
                     RedirectStandardOutput = true,
                     CreateNoWindow = true,

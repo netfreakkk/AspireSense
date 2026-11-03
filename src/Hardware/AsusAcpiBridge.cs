@@ -30,6 +30,7 @@ namespace AspireSense
         public const uint DevsGPUFanCurve = 0x00110025; // GPU Fan curve points (16 bytes)
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern IntPtr CreateFile(
             string lpFileName,
             uint dwDesiredAccess,
@@ -41,6 +42,7 @@ namespace AspireSense
         );
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern bool DeviceIoControl(
             IntPtr hDevice,
             uint dwIoControlCode,
@@ -53,6 +55,7 @@ namespace AspireSense
         );
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern bool CloseHandle(IntPtr hObject);
 
         private const uint GENERIC_READ = 0x80000000;
