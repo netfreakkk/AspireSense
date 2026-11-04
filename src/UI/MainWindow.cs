@@ -178,9 +178,17 @@ namespace AspireSense
         private int watchdogCoolCount = 0;
         private bool watchdogActive = false;
         private int watchdogPreviousMode = 0;
+        private bool startInTray = false;
+        private System.Windows.Forms.NotifyIcon trayIcon;
+        private bool isExplicitExit = false;
+        private bool balloonTipShown = false;
+        private uint wmShowInstance = 0;
 
-        public MainWindow()
+        public MainWindow() : this(false) { }
+
+        public MainWindow(bool startMinimized)
         {
+            this.startInTray = startMinimized;
             this.Title = "ASPIRESENSE";
             this.Width = 1180;
             this.Height = 720;
@@ -231,6 +239,17 @@ namespace AspireSense
             // CRITICAL HARDWARE SAFETY: Reset EC fan controller to Auto when app is closed, terminated, or crashes
             this.Closing += (s, e) =>
             {
+                if (!isExplicitExit)
+                {
+                    e.Cancel = true;
+                    HideToTray();
+                    return;
+                }
+
+                if (trayIcon != null)
+                {
+                    try { trayIcon.Visible = false; trayIcon.Dispose(); trayIcon = null; } catch { }
+                }
                 if (timer != null)
                 {
                     timer.Stop();
@@ -299,9 +318,18 @@ namespace AspireSense
                 {
                     source.AddHook(HwndHook);
                     RegisterHotKey(source.Handle, 9001, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_O);
+                    wmShowInstance = Program.RegisterWindowMessage(Program.MSG_SHOW_INSTANCE);
                 }
             }
             catch { }
+
+            InitSystemTray();
+
+            if (startInTray)
+            {
+                this.WindowState = WindowState.Minimized;
+                this.Hide();
+            }
         }
 
         private IntPtr HwndHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -309,6 +337,11 @@ namespace AspireSense
             if (msg == WM_HOTKEY && wParam.ToInt32() == 9001)
             {
                 ToggleOverlay();
+                handled = true;
+            }
+            else if (wmShowInstance != 0 && msg == (int)wmShowInstance)
+            {
+                ShowFromTray();
                 handled = true;
             }
             else if (msg == WM_POWERBROADCAST)
@@ -329,6 +362,119 @@ namespace AspireSense
         private bool isSystemSuspended = false;
         private int lastResumeTick = 0;
         private readonly object powerLock = new object();
+
+        private void InitSystemTray()
+        {
+            try
+            {
+                string icoPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app.ico");
+                System.Drawing.Icon icon = File.Exists(icoPath) ? new System.Drawing.Icon(icoPath) : System.Drawing.SystemIcons.Application;
+
+                trayIcon = new System.Windows.Forms.NotifyIcon
+                {
+                    Icon = icon,
+                    Text = "AspireSense - Thermal & Acoustic Arbiter",
+                    Visible = true
+                };
+
+                System.Windows.Forms.ContextMenuStrip menu = new System.Windows.Forms.ContextMenuStrip();
+
+                System.Windows.Forms.ToolStripMenuItem itemOpen = new System.Windows.Forms.ToolStripMenuItem("⚡ Open AspireSense");
+                itemOpen.Font = new System.Drawing.Font(itemOpen.Font, System.Drawing.FontStyle.Bold);
+                itemOpen.Click += (s, e) => ShowFromTray();
+                menu.Items.Add(itemOpen);
+
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
+                System.Windows.Forms.ToolStripMenuItem itemAuto = new System.Windows.Forms.ToolStripMenuItem("🛡️ Dynamic Auto");
+                itemAuto.Click += (s, e) => { ApplyMode(0, "Dynamic Auto"); };
+                menu.Items.Add(itemAuto);
+
+                System.Windows.Forms.ToolStripMenuItem itemQuiet = new System.Windows.Forms.ToolStripMenuItem("🤫 Silent / Quiet Mode");
+                itemQuiet.Click += (s, e) => { ApplyMode(3, "Silent / Quiet (Acoustic Cap)"); };
+                menu.Items.Add(itemQuiet);
+
+                System.Windows.Forms.ToolStripMenuItem itemMax = new System.Windows.Forms.ToolStripMenuItem("🚀 Turbo Max (100%)");
+                itemMax.Click += (s, e) => { ApplyMode(1, "Max (100% Turbo Cooling)"); };
+                menu.Items.Add(itemMax);
+
+                System.Windows.Forms.ToolStripMenuItem itemFlush = new System.Windows.Forms.ToolStripMenuItem("❄️ Engage Turbo Flush (60s)");
+                itemFlush.Click += (s, e) =>
+                {
+                    heatFlushRemaining = 60;
+                    ApplyMode(1, "Max (60s Turbo Heat Flush Engaged)");
+                };
+                menu.Items.Add(itemFlush);
+
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
+                System.Windows.Forms.ToolStripMenuItem itemHud = new System.Windows.Forms.ToolStripMenuItem("🎮 Toggle In-Game HUD (Ctrl+Shift+O)");
+                itemHud.Click += (s, e) => ToggleOverlay();
+                menu.Items.Add(itemHud);
+
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
+                System.Windows.Forms.ToolStripMenuItem itemExit = new System.Windows.Forms.ToolStripMenuItem("❌ Exit AspireSense");
+                itemExit.Click += (s, e) => ExitApplication();
+                menu.Items.Add(itemExit);
+
+                trayIcon.ContextMenuStrip = menu;
+
+                trayIcon.DoubleClick += (s, e) => ShowFromTray();
+                trayIcon.MouseClick += (s, e) =>
+                {
+                    if (e.Button == System.Windows.Forms.MouseButtons.Left)
+                    {
+                        if (this.IsVisible && this.WindowState != WindowState.Minimized)
+                        {
+                            HideToTray();
+                        }
+                        else
+                        {
+                            ShowFromTray();
+                        }
+                    }
+                };
+            }
+            catch { }
+        }
+
+        public void ShowFromTray()
+        {
+            this.Show();
+            this.WindowState = WindowState.Normal;
+            this.Activate();
+            this.Focus();
+        }
+
+        public void HideToTray()
+        {
+            this.Hide();
+            if (!balloonTipShown)
+            {
+                balloonTipShown = true;
+                if (trayIcon != null)
+                {
+                    try
+                    {
+                        trayIcon.ShowBalloonTip(2500, "AspireSense Protected",
+                            "AspireSense is guarding thermals in the background. Click this tray icon anytime to open.",
+                            System.Windows.Forms.ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        public void ExitApplication()
+        {
+            isExplicitExit = true;
+            if (trayIcon != null)
+            {
+                try { trayIcon.Visible = false; trayIcon.Dispose(); trayIcon = null; } catch { }
+            }
+            this.Close();
+        }
 
         private void OnSystemSuspend()
         {
@@ -698,7 +844,7 @@ namespace AspireSense
             };
             btnMin.MouseEnter += (s, e) => { btnMin.Background = DesignTokens.BrushBgCardHover; btnMin.Foreground = DesignTokens.BrushTextPrimary; };
             btnMin.MouseLeave += (s, e) => { btnMin.Background = Brushes.Transparent; btnMin.Foreground = DesignTokens.BrushTextSecondary; };
-            btnMin.Click += (s, e) => { this.WindowState = WindowState.Minimized; };
+            btnMin.Click += (s, e) => { HideToTray(); };
             winBtnSp.Children.Add(btnMin);
 
             Button btnClose = new Button
@@ -714,7 +860,7 @@ namespace AspireSense
             };
             btnClose.MouseEnter += (s, e) => { btnClose.Background = DesignTokens.BrushAccentRed; btnClose.Foreground = Brushes.White; };
             btnClose.MouseLeave += (s, e) => { btnClose.Background = Brushes.Transparent; btnClose.Foreground = DesignTokens.BrushTextSecondary; };
-            btnClose.Click += (s, e) => { this.Close(); };
+            btnClose.Click += (s, e) => { HideToTray(); };
             winBtnSp.Children.Add(btnClose);
 
             Grid.SetColumn(winBtnSp, 2);
@@ -1011,6 +1157,15 @@ namespace AspireSense
 
                 // 3. Active Thermal Watchdog (Always safeguard hardware in background)
                 EvaluateThermalWatchdog(d);
+
+                // Live System Tray Status Tooltip
+                if (trayIcon != null)
+                {
+                    string modeStr = currentFanMode == 1 ? "Turbo" : (currentFanMode == 3 ? "Quiet" : (currentFanMode == 6 ? "Custom" : "Auto"));
+                    string tip = string.Format("AspireSense • CPU {0}°C | GPU {1}°C [{2}]", d.CpuTemp, d.GpuTemp, modeStr);
+                    if (tip.Length > 63) tip = tip.Substring(0, 63);
+                    try { trayIcon.Text = tip; } catch { }
+                }
 
                 // 4. PERFORMANCE OPTIMIZATION (Action Plan 4.4):
                 // Skip all heavy WPF visual tree layout/rendering when window is minimized or hidden
