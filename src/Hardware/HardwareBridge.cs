@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -423,9 +423,9 @@ namespace AspireSense
 
         private static bool sleepWakeProtectionChecked = false;
 
-        public static void EnsureSleepWakeProtection()
+        public static void EnsureSleepWakeProtection(bool force = false)
         {
-            if (sleepWakeProtectionChecked) return;
+            if (sleepWakeProtectionChecked && !force) return;
             sleepWakeProtectionChecked = true;
 
             try
@@ -445,19 +445,27 @@ namespace AspireSense
                         p.WaitForExit(1000);
                         if (!string.IsNullOrEmpty(output))
                         {
-                            string low = output.ToLowerInvariant();
-                            if (low.Contains("mouse") || low.Contains("realtek"))
+                            string[] lines = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                            foreach (string rawLine in lines)
                             {
-                                string[] devs = new string[] { "HID-compliant mouse", "Realtek PCIe GbE Family Controller" };
-                                foreach (string dev in devs)
+                                string dev = rawLine.Trim();
+                                if (string.IsNullOrEmpty(dev) || dev.Equals("NONE", StringComparison.OrdinalIgnoreCase))
+                                    continue;
+
+                                try
                                 {
                                     ProcessStartInfo dis = new ProcessStartInfo(powercfg, string.Format("/devicedisablewake \"{0}\"", dev))
                                     {
                                         CreateNoWindow = true,
                                         UseShellExecute = false
                                     };
-                                    using (Process dp = Process.Start(dis)) { if (dp != null) dp.WaitForExit(1000); }
+                                    using (Process dp = Process.Start(dis))
+                                    {
+                                        if (dp != null) dp.WaitForExit(1000);
+                                    }
+                                    EcAntiHallucinationEngine.LogDecision(string.Format("SLEEP PROTECT: Disarmed rogue wake device '{0}'", dev));
                                 }
+                                catch { }
                             }
                         }
                     }

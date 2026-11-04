@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -485,6 +485,7 @@ namespace AspireSense
 
                 try
                 {
+                    HardwareBridge.EnsureSleepWakeProtection(true);
                     EcAntiHallucinationEngine.LogDecision("POWER SUSPEND: Sleep detected -> Restoring fans to Auto & pausing background telemetry");
                     if (timer != null) timer.Stop();
                     if (overlayTimer != null) overlayTimer.Stop();
