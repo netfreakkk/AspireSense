@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -173,6 +173,7 @@ namespace AspireSense
 
         public static void InitializeHardware()
         {
+            lock (closeLock) { isHardwareClosed = false; }
             try
             {
                 int res = nvmlInit();

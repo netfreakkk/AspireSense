@@ -572,6 +572,33 @@ namespace AspireSense
             });
             btnSp.Children.Add(btnNvidia);
 
+            Border btnFixWake = CreateToolButton("🌙 Fix Sleep Wake", () =>
+            {
+                try
+                {
+                    string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
+                    string[] devicesToDisarm = new string[] { "HID-compliant mouse", "Realtek PCIe GbE Family Controller" };
+                    foreach (string dev in devicesToDisarm)
+                    {
+                        ProcessStartInfo psi = new ProcessStartInfo(powercfg, string.Format("/devicedisablewake \"{0}\"", dev))
+                        {
+                            CreateNoWindow = true,
+                            UseShellExecute = false
+                        };
+                        using (Process p = Process.Start(psi)) { if (p != null) p.WaitForExit(1000); }
+                    }
+
+                    EcAntiHallucinationEngine.LogDecision("CONFIG: Sleep ghost-wake protection armed. Mouse & Ethernet wake disabled.");
+                    MessageBox.Show("Sleep Ghost Wake Protection Applied!\r\n\r\nDisabled sleep-wake on mouse and Ethernet adapter.\r\nTurning off your external display or bumping your mouse will no longer wake the laptop from sleep.",
+                        "Sleep Wake Fix Applied", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Error applying sleep wake fix: " + ex.Message, "AspireSense", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            });
+            btnSp.Children.Add(btnFixWake);
+
             Grid.SetColumn(btnSp, 1);
             inner.Children.Add(btnSp);
 

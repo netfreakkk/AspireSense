@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -113,6 +113,10 @@ namespace AspireSense
         public const uint MOD_NOREPEAT = 0x4000;
         public const int WM_HOTKEY = 0x0312;
         public const uint VK_O = 0x4F;
+        public const int WM_POWERBROADCAST = 0x0218;
+        public const int PBT_APMSUSPEND = 0x0004;
+        public const int PBT_APMRESUMESUSPEND = 0x0007;
+        public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
 
         [DllImport("user32.dll")]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
@@ -270,6 +274,18 @@ namespace AspireSense
                 HardwareBridge.CloseHardware();
             };
 
+            Microsoft.Win32.SystemEvents.PowerModeChanged += (s, e) =>
+            {
+                if (e.Mode == Microsoft.Win32.PowerModes.Suspend)
+                {
+                    OnSystemSuspend();
+                }
+                else if (e.Mode == Microsoft.Win32.PowerModes.Resume)
+                {
+                    OnSystemResume();
+                }
+            };
+
             Timer_Tick(null, null);
         }
 
@@ -295,7 +311,101 @@ namespace AspireSense
                 ToggleOverlay();
                 handled = true;
             }
+            else if (msg == WM_POWERBROADCAST)
+            {
+                int eventCode = wParam.ToInt32();
+                if (eventCode == PBT_APMSUSPEND)
+                {
+                    OnSystemSuspend();
+                }
+                else if (eventCode == PBT_APMRESUMESUSPEND || eventCode == PBT_APMRESUMEAUTOMATIC)
+                {
+                    OnSystemResume();
+                }
+            }
             return IntPtr.Zero;
+        }
+
+        private bool isSystemSuspended = false;
+        private int lastResumeTick = 0;
+        private readonly object powerLock = new object();
+
+        private void OnSystemSuspend()
+        {
+            lock (powerLock)
+            {
+                if (isSystemSuspended) return;
+                isSystemSuspended = true;
+
+                try
+                {
+                    EcAntiHallucinationEngine.LogDecision("POWER SUSPEND: Sleep detected -> Restoring fans to Auto & pausing background telemetry");
+                    if (timer != null) timer.Stop();
+                    if (overlayTimer != null) overlayTimer.Stop();
+                    GameTelemetryEngine.Stop();
+                    HardwareBridge.ResetToAuto();
+                    HardwareBridge.CloseHardware();
+                }
+                catch { }
+            }
+        }
+
+        private void OnSystemResume()
+        {
+            lock (powerLock)
+            {
+                int now = Environment.TickCount;
+                if (lastResumeTick != 0 && (now - lastResumeTick) < 1500) return; // Debounce dual notifications
+                lastResumeTick = now;
+                isSystemSuspended = false;
+
+                try
+                {
+                    EcAntiHallucinationEngine.LogDecision("POWER RESUME: System wake detected -> Suppressing post-wake EC emergency 100% fan ramp");
+
+                    // Allow hardware bus, PCIe dGPU, and EC firmware ~600ms to power up and stabilize
+                    DispatcherTimer resumeTimer = new DispatcherTimer();
+                    resumeTimer.Interval = TimeSpan.FromMilliseconds(600);
+                    resumeTimer.Tick += (s, e) =>
+                    {
+                        resumeTimer.Stop();
+                        try
+                        {
+                            HardwareBridge.InitializeHardware();
+
+                            // Force firmware handshake to cancel EC POST emergency 100% turbo fan blast
+                            if (HardwareBridge.DetectedVendor == HardwareVendor.Acer)
+                            {
+                                AcerInsydeBridge.ResetFans();
+                                if (currentFanMode != 0)
+                                {
+                                    HardwareBridge.SetFanMode(currentFanMode);
+                                }
+                            }
+                            else
+                            {
+                                HardwareBridge.SetFanMode(currentFanMode);
+                            }
+
+                            // Reset anti-hallucination engine calibration from fresh post-wake temperatures
+                            EcAntiHallucinationEngine.FilteredThermalEma = 0;
+                            EcAntiHallucinationEngine.SustainedLoadDurationSec = 0;
+                            EcAntiHallucinationEngine.CurrentAppliedMode = -1;
+                            watchdogHighHeatCount = 0;
+                            watchdogCoolCount = 0;
+                            watchdogActive = false;
+
+                            if (timer != null && !timer.IsEnabled) timer.Start();
+                            EnsureTelemetryState();
+
+                            EcAntiHallucinationEngine.LogDecision("POWER RESUME COMPLETE: Fans normalized and thermal monitoring restored.");
+                        }
+                        catch { }
+                    };
+                    resumeTimer.Start();
+                }
+                catch { }
+            }
         }
 
         private void EnsureTelemetryState()
