@@ -417,7 +417,53 @@ namespace AspireSense
             }
             catch { }
 
+            EnsureSleepWakeProtection();
             ResetToAuto();
+        }
+
+        private static bool sleepWakeProtectionChecked = false;
+
+        public static void EnsureSleepWakeProtection()
+        {
+            if (sleepWakeProtectionChecked) return;
+            sleepWakeProtectionChecked = true;
+
+            try
+            {
+                string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
+                ProcessStartInfo psi = new ProcessStartInfo(powercfg, "/devicequery wake_armed")
+                {
+                    RedirectStandardOutput = true,
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(1000);
+                        if (!string.IsNullOrEmpty(output))
+                        {
+                            string low = output.ToLowerInvariant();
+                            if (low.Contains("mouse") || low.Contains("realtek"))
+                            {
+                                string[] devs = new string[] { "HID-compliant mouse", "Realtek PCIe GbE Family Controller" };
+                                foreach (string dev in devs)
+                                {
+                                    ProcessStartInfo dis = new ProcessStartInfo(powercfg, string.Format("/devicedisablewake \"{0}\"", dev))
+                                    {
+                                        CreateNoWindow = true,
+                                        UseShellExecute = false
+                                    };
+                                    using (Process dp = Process.Start(dis)) { if (dp != null) dp.WaitForExit(1000); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
         }
 
         private static bool isHardwareClosed = false;
