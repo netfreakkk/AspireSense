@@ -417,14 +417,142 @@ namespace AspireSense
             }
             catch { }
 
+            LoadSleepWakePreference();
             EnsureSleepWakeProtection();
             ResetToAuto();
         }
 
+        private static bool sleepWakeShieldEnabled = true;
+        public static bool SleepWakeShieldEnabled
+        {
+            get { return sleepWakeShieldEnabled; }
+            set { sleepWakeShieldEnabled = value; }
+        }
+        private static bool sleepWakePreferenceLoaded = false;
         private static bool sleepWakeProtectionChecked = false;
+
+        public static void LoadSleepWakePreference()
+        {
+            if (sleepWakePreferenceLoaded) return;
+            sleepWakePreferenceLoaded = true;
+
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\AspireSense"))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue("SleepWakeShield");
+                        if (val != null)
+                        {
+                            SleepWakeShieldEnabled = Convert.ToInt32(val) != 0;
+                            return;
+                        }
+                    }
+                }
+            }
+            catch { }
+            SleepWakeShieldEnabled = true;
+        }
+
+        public static void SetSleepWakeProtection(bool enable)
+        {
+            SleepWakeShieldEnabled = enable;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(@"Software\AspireSense"))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("SleepWakeShield", enable ? 1 : 0, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
+            if (enable)
+            {
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo(powercfg, "/devicequery wake_armed")
+                    {
+                        RedirectStandardOutput = true,
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    using (Process p = Process.Start(psi))
+                    {
+                        if (p != null)
+                        {
+                            string output = p.StandardOutput.ReadToEnd();
+                            p.WaitForExit(1000);
+                            if (!string.IsNullOrEmpty(output))
+                            {
+                                string[] lines = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                                foreach (string rawLine in lines)
+                                {
+                                    string dev = rawLine.Trim();
+                                    if (string.IsNullOrEmpty(dev) || dev.Equals("NONE", StringComparison.OrdinalIgnoreCase))
+                                        continue;
+
+                                    try
+                                    {
+                                        ProcessStartInfo dis = new ProcessStartInfo(powercfg, string.Format("/devicedisablewake \"{0}\"", dev))
+                                        {
+                                            CreateNoWindow = true,
+                                            UseShellExecute = false
+                                        };
+                                        using (Process dp = Process.Start(dis))
+                                        {
+                                            if (dp != null) dp.WaitForExit(1000);
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                    }
+                    EcAntiHallucinationEngine.LogDecision("SLEEP SHIELD: ON -> Ghost wake immunity active (all USB/network devices disarmed)");
+                }
+                catch { }
+            }
+            else
+            {
+                try
+                {
+                    string[] restoreDevs = new string[] { "HID-compliant mouse", "HID Keyboard Device (003)" };
+                    foreach (string dev in restoreDevs)
+                    {
+                        try
+                        {
+                            ProcessStartInfo ena = new ProcessStartInfo(powercfg, string.Format("/deviceenablewake \"{0}\"", dev))
+                            {
+                                CreateNoWindow = true,
+                                UseShellExecute = false
+                            };
+                            using (Process ep = Process.Start(ena))
+                            {
+                                if (ep != null) ep.WaitForExit(1000);
+                            }
+                        }
+                        catch { }
+                    }
+                    EcAntiHallucinationEngine.LogDecision("SLEEP SHIELD: OFF -> Peripheral wake enabled (external devices can wake PC)");
+                }
+                catch { }
+            }
+        }
+
+        public static void ToggleSleepWakeProtection()
+        {
+            SetSleepWakeProtection(!SleepWakeShieldEnabled);
+        }
 
         public static void EnsureSleepWakeProtection(bool force = false)
         {
+            LoadSleepWakePreference();
+            if (!SleepWakeShieldEnabled && !force) return;
             if (sleepWakeProtectionChecked && !force) return;
             sleepWakeProtectionChecked = true;
 

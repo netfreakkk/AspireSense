@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -572,32 +572,39 @@ namespace AspireSense
             });
             btnSp.Children.Add(btnNvidia);
 
-            Border btnFixWake = CreateToolButton("🌙 Fix Sleep Wake", () =>
+            btnToolSleepShield = new Border
             {
-                try
+                Background = HardwareBridge.SleepWakeShieldEnabled ? new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)) : DesignTokens.BrushBgInput,
+                BorderBrush = HardwareBridge.SleepWakeShieldEnabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(10, 6, 10, 6),
+                Margin = new Thickness(4, 0, 4, 0),
+                Cursor = Cursors.Hand
+            };
+            lblToolSleepShieldText = new TextBlock
+            {
+                Text = HardwareBridge.SleepWakeShieldEnabled ? "🌙 Sleep Shield: ON" : "🌙 Sleep Shield: OFF",
+                FontSize = 10,
+                FontWeight = FontWeights.Bold,
+                Foreground = HardwareBridge.SleepWakeShieldEnabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushTextSecondary
+            };
+            btnToolSleepShield.Child = lblToolSleepShieldText;
+            btnToolSleepShield.MouseDown += (s, e) =>
+            {
+                HardwareBridge.ToggleSleepWakeProtection();
+                UpdateSleepShieldUi();
+                if (lblStatusMsg != null)
                 {
-                    string powercfg = System.IO.Path.Combine(Environment.SystemDirectory, "powercfg.exe");
-                    string[] devicesToDisarm = new string[] { "HID-compliant mouse", "Realtek PCIe GbE Family Controller" };
-                    foreach (string dev in devicesToDisarm)
-                    {
-                        ProcessStartInfo psi = new ProcessStartInfo(powercfg, string.Format("/devicedisablewake \"{0}\"", dev))
-                        {
-                            CreateNoWindow = true,
-                            UseShellExecute = false
-                        };
-                        using (Process p = Process.Start(psi)) { if (p != null) p.WaitForExit(1000); }
-                    }
-
-                    EcAntiHallucinationEngine.LogDecision("CONFIG: Sleep ghost-wake protection armed. Mouse & Ethernet wake disabled.");
-                    MessageBox.Show("Sleep Ghost Wake Protection Applied!\r\n\r\nDisabled sleep-wake on mouse and Ethernet adapter.\r\nTurning off your external display or bumping your mouse will no longer wake the laptop from sleep.",
-                        "Sleep Wake Fix Applied", MessageBoxButton.OK, MessageBoxImage.Information);
+                    lblStatusMsg.Text = HardwareBridge.SleepWakeShieldEnabled
+                        ? "Sleep Shield Active: Rogue wakeups blocked"
+                        : "Sleep Shield Disabled: Peripherals can wake PC";
+                    lblStatusMsg.Foreground = HardwareBridge.SleepWakeShieldEnabled
+                        ? DesignTokens.BrushAccentCyan
+                        : DesignTokens.BrushTextMuted;
                 }
-                catch (Exception ex)
-                {
-                    MessageBox.Show("Error applying sleep wake fix: " + ex.Message, "AspireSense", MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
-            });
-            btnSp.Children.Add(btnFixWake);
+            };
+            btnSp.Children.Add(btnToolSleepShield);
 
             Grid.SetColumn(btnSp, 1);
             inner.Children.Add(btnSp);

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -299,6 +299,53 @@ namespace AspireSense
                 btnEcBoostTamer.BorderBrush = EcAntiHallucinationEngine.PowerBoostTamed ? DesignTokens.BrushAccentGreen : DesignTokens.BrushBorderSubtle;
             };
             sp.Children.Add(btnEcBoostTamer);
+
+            // 3. Ghost Sleep-Wake Immunity Shield
+            btnEcSleepShield = new Border
+            {
+                Background = HardwareBridge.SleepWakeShieldEnabled ? new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)) : DesignTokens.BrushBgInput,
+                BorderBrush = HardwareBridge.SleepWakeShieldEnabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(12, 8, 12, 8),
+                Margin = new Thickness(0, 0, 0, 12),
+                Cursor = Cursors.Hand
+            };
+            StackPanel sSp = new StackPanel();
+            lblEcSleepShieldTitle = new TextBlock
+            {
+                Text = HardwareBridge.SleepWakeShieldEnabled ? "🌙 Ghost Sleep-Wake Shield: ACTIVE" : "🌙 Ghost Sleep-Wake Shield: DISABLED",
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = HardwareBridge.SleepWakeShieldEnabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushTextSecondary
+            };
+            sSp.Children.Add(lblEcSleepShieldTitle);
+            lblEcSleepShieldSub = new TextBlock
+            {
+                Text = HardwareBridge.SleepWakeShieldEnabled 
+                    ? "Blocks external monitor off, USB hub spikes & mouse jitter from waking laptop."
+                    : "External peripherals are allowed to wake laptop. Monitor power-off may trigger wake.",
+                FontSize = 9.5,
+                Foreground = DesignTokens.BrushTextMuted,
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            sSp.Children.Add(lblEcSleepShieldSub);
+            btnEcSleepShield.Child = sSp;
+            btnEcSleepShield.MouseDown += (s, e) =>
+            {
+                HardwareBridge.ToggleSleepWakeProtection();
+                UpdateSleepShieldUi();
+                if (lblStatusMsg != null)
+                {
+                    lblStatusMsg.Text = HardwareBridge.SleepWakeShieldEnabled
+                        ? "Sleep Shield Active: Rogue wakeups blocked"
+                        : "Sleep Shield Disabled: Peripherals can wake PC";
+                    lblStatusMsg.Foreground = HardwareBridge.SleepWakeShieldEnabled
+                        ? DesignTokens.BrushAccentCyan
+                        : DesignTokens.BrushTextMuted;
+                }
+            };
+            sp.Children.Add(btnEcSleepShield);
 
             // 3. Heatsink Thermal Saturation Bar
             lblHeatsinkSatText = new TextBlock

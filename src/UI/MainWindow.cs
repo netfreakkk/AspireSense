@@ -63,6 +63,12 @@ namespace AspireSense
         private Border btnEcBoostTamer;
         private TextBlock lblEcBoostTamerText;
         private TextBlock lblEcBoostTamerStatus;
+        private Border btnToolSleepShield;
+        private TextBlock lblToolSleepShieldText;
+        private Border btnEcSleepShield;
+        private TextBlock lblEcSleepShieldTitle;
+        private TextBlock lblEcSleepShieldSub;
+        private System.Windows.Forms.ToolStripMenuItem itemTraySleepShield;
         private TextBlock txtDecisionLog;
 
         // Dashboard Speedometers
@@ -225,6 +231,7 @@ namespace AspireSense
             EcAntiHallucinationEngine.CheckCurrentPowerPlanState();
             EcAntiHallucinationEngine.LogDecision("ASPIRASENSE ARBITER INITIALIZED: Monitoring real thermal energy vs transient bursts");
             UpdateDashboardEcGuardUi();
+            UpdateSleepShieldUi();
 
             timer = new DispatcherTimer();
             timer.Interval = TimeSpan.FromSeconds(1);
@@ -414,6 +421,17 @@ namespace AspireSense
 
                 menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
 
+                itemTraySleepShield = new System.Windows.Forms.ToolStripMenuItem("🌙 Sleep Ghost Shield");
+                itemTraySleepShield.Checked = HardwareBridge.SleepWakeShieldEnabled;
+                itemTraySleepShield.Click += (s, e) =>
+                {
+                    HardwareBridge.ToggleSleepWakeProtection();
+                    UpdateSleepShieldUi();
+                };
+                menu.Items.Add(itemTraySleepShield);
+
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+
                 System.Windows.Forms.ToolStripMenuItem itemExit = new System.Windows.Forms.ToolStripMenuItem("❌ Exit AspireSense");
                 itemExit.Click += (s, e) => ExitApplication();
                 menu.Items.Add(itemExit);
@@ -476,6 +494,43 @@ namespace AspireSense
             this.Close();
         }
 
+        public void UpdateSleepShieldUi()
+        {
+            bool enabled = HardwareBridge.SleepWakeShieldEnabled;
+
+            if (lblToolSleepShieldText != null && btnToolSleepShield != null)
+            {
+                lblToolSleepShieldText.Text = enabled ? "🌙 Sleep Shield: ON" : "🌙 Sleep Shield: OFF";
+                lblToolSleepShieldText.Foreground = enabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushTextSecondary;
+                btnToolSleepShield.Background = enabled ? new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)) : DesignTokens.BrushBgInput;
+                btnToolSleepShield.BorderBrush = enabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushBorderSubtle;
+                btnToolSleepShield.ToolTip = enabled
+                    ? "Ghost Wake Shield ACTIVE: USB jitter, mouse bumps, and monitor power-off will NOT wake the laptop. Click to toggle OFF."
+                    : "Ghost Wake Shield OFF: External mouse and keyboard CAN wake the laptop. Click to toggle ON.";
+            }
+
+            if (lblEcSleepShieldTitle != null && btnEcSleepShield != null)
+            {
+                lblEcSleepShieldTitle.Text = enabled
+                    ? "🌙 Ghost Sleep-Wake Shield: ACTIVE"
+                    : "🌙 Ghost Sleep-Wake Shield: DISABLED";
+                lblEcSleepShieldTitle.Foreground = enabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushTextSecondary;
+                if (lblEcSleepShieldSub != null)
+                {
+                    lblEcSleepShieldSub.Text = enabled
+                        ? "Blocks external monitor off, USB hub spikes & mouse jitter from waking laptop."
+                        : "External peripherals are allowed to wake laptop. Monitor power-off may trigger wake.";
+                }
+                btnEcSleepShield.Background = enabled ? new SolidColorBrush(Color.FromArgb(40, 6, 182, 212)) : DesignTokens.BrushBgInput;
+                btnEcSleepShield.BorderBrush = enabled ? DesignTokens.BrushAccentCyan : DesignTokens.BrushBorderSubtle;
+            }
+
+            if (itemTraySleepShield != null)
+            {
+                itemTraySleepShield.Checked = enabled;
+            }
+        }
+
         private void OnSystemSuspend()
         {
             lock (powerLock)
@@ -485,7 +540,7 @@ namespace AspireSense
 
                 try
                 {
-                    HardwareBridge.EnsureSleepWakeProtection(true);
+                    HardwareBridge.EnsureSleepWakeProtection(false);
                     EcAntiHallucinationEngine.LogDecision("POWER SUSPEND: Sleep detected -> Restoring fans to Auto & pausing background telemetry");
                     if (timer != null) timer.Stop();
                     if (overlayTimer != null) overlayTimer.Stop();
